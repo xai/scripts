@@ -26,6 +26,6 @@ usage () {
 	echo "usage: $0 <maildir>"
 }
 
-if [ -z $1 ] || [ "$1" = "help" ] || [ ! -d $1 ]; then usage; exit 1; fi
+if [ -z "$1" ] || [ "$1" = "help" ] || [ ! -d $1 ]; then usage; exit 1; fi
 
 find $1 -type f -exec sed -i -e '1!b' -e '/X-OfflineIMAP:.*/d' {} \; -exec sed -i -e '1!b' -e '/^$/d' {} \;
