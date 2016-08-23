@@ -1,0 +1,85 @@
+#!/bin/bash
+#
+# check-ports -
+#	Wurde die Portbelegung veraendert?
+#
+#			   17.07.2012	  Olaf Lessenich
+#
+
+PATH='/bin:/usr/bin'
+umask 177
+
+usage () {
+  echo "usage: check-ports "
+  echo "		 -p # prepare Database"
+  echo "		 -m <MAILADDresse> # mail output"
+}
+
+if [ "$1" = "help" ]; then usage; exit 1;  fi
+
+PROG="$0"
+AUFRUF="$*"
+MAILADD=""
+OUT="/tmp/check-ports.$$"
+
+HOST=$(hostname)
+
+getports() {
+  lsof -i -n -P | awk '/LISTEN/ { print $1"/"$3"/"$8 }' | sort -u
+}
+
+for i; do
+  case "$1" in
+	-p) PREPARE="P";		  ;;
+	-m) MAILADD="$MAILADD $2";	shift  ;;
+	-*) usage; exit 1;		  ;;
+  esac
+  [ $# -gt 0 ] && shift
+done
+
+[ `whoami` != "root" ] && echo "Bitte nur als root ausfuehren!" && exit 1
+
+TMP="/tmp/check-ports-1.$$"
+REFDIR="${HOME}/check"
+
+# Datenbasis nur vorbereiten:
+if [ "$PREPARE" = "P" ]; then
+	REF="${REFDIR}/${HOST}.ports"
+	getports > $TMP
+	if [ -f "$TMP" ]; then
+		[ -f $REF ] && mv $REF $REF.`date '+%d%m%y'`
+		mv $TMP $REF
+	fi
+  exit 0
+fi
+
+REF="${REFDIR}/${HOST}.ports"
+getports > $TMP
+if [ -f "$TMP" ]; then
+	diff $TMP $REF > $OUT
+	rm $TMP
+fi
+
+if [ -s $OUT ]; then
+	if [ "$MAILADD" != "" ]; then
+		PROG_BASE=`basename $PROG`
+		echo ""					   >> $OUT
+		echo "Achtung: $HOST LISTEN-Status geaendert" >> $OUT
+		echo "Systemueberpruefung ist notwendig!">> $OUT
+		echo "Danach eventuell neues Check-File generieren:" >> $OUT
+	CALL=`echo "$AUFRUF" | sed "s/-m $MAILADD//"`
+		echo "# $PROG -p" >> $OUT
+		echo "------------------------------------------------" >> $OUT
+		( echo; echo "$HOST: $PROG $AUFRUF"; echo; cat $OUT; echo ) \
+										 | mailx -s "$HOST: $PROG_BASE" "$MAILADD"
+	else
+		# Ausgabe am Bildschirm
+		echo; echo @$HOST:; echo; cat $OUT
+	fi
+fi
+
+[ -f $OUT ] && rm $OUT
+[ -f $TMP ] && rm $TMP
+exit 0
+
+
