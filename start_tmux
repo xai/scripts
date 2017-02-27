@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+
+set -u
+hostname=$(hostname -s)
+
+function setup_panes() {
+	session=${1:-}
+	shift
+	window=${1:-}
+	shift
+	cmd=${@:-}
+
+	for pane in $(tmux list-panes -F '#P' -t "${session}:${window}"); do
+		tmux send-keys -t "${session}:${window}.$pane" "${cmd}" C-m
+	done
+}
+
+function setup_window() {
+	session=${1:-}
+	window=${2:-}
+
+	if [ "${session}" != "write" ]; then
+		tmux split-window -h -t ${session}:${window}.1
+		if [ "${session}" != "mail" ]; then
+			tmux split-window -v -t ${session}:${window}.2
+		fi
+	fi
+
+	if [ "${session}" == "code" ]; then
+		setup_panes "${session}" "${window}" "cd ~/src/${window}"
+	elif [ "${session}" == "deploy" ]; then
+		setup_panes "${session}" "${window}" "cd ~/evaluation/${window}"
+	elif [ "${session}" == "write" ]; then
+		setup_panes "${session}" "${window}" "cd ~/paper/${window}"
+	fi
+}
+
+function setup_session() {
+	session=${1:-}
+	shift
+	tmux has-session -t ${session} &> /dev/null
+	if [ $? != 0 ]
+	then
+		firstwindow=${1:-}
+		shift
+		tmux new-session -s ${session} -n ${firstwindow} -d
+		setup_window "${session}" "${firstwindow}"
+
+		windows=${@:-}
+		for window in $windows; do
+			tmux new-window -a -n ${window} -t ${session}
+			setup_window "${session}" "${window}"
+		done
+	fi
+}
+
+setup_session "${hostname}" "root"
+setup_session "mail" "mutt"
+setup_session "code" "jdime" "jdime-testfiles"
+setup_session "deploy" "lookahead"
+setup_session "write" "lookahead"
+
+tmux send-keys -t "${hostname}:root.2" "top" C-m
+tmux send-keys -t "${hostname}:root.3" "journalctl -k -f" C-m
+
+tmux send-keys -t "mail:mutt.1" "offlineimap -u ttyui" C-m
+tmux send-keys -t "mail:mutt.2" "mutt" C-m
+
+tmux select-pane -t "${hostname}:root.1"
+tmux select-pane -t "${hostname}:root.1"
+
+tmux attach -t "${hostname}"
