@@ -28,4 +28,8 @@ usage () {
 
 if [ -z "$1" ] || [ "$1" = "help" ] || [ ! -d $1 ]; then usage; exit 1; fi
 
-find $1 -type f -exec sed -i -e '1!b' -e '/X-OfflineIMAP:.*/d' {} \; -exec sed -i -e '1!b' -e '/^$/d' {} \;
+find $1 -type f \
+	-exec sh -c 'head -n1 "{}" | grep -q X-OfflineIMAP' \; \
+	-exec sed -i -e '1!b;/X-OfflineIMAP:.*/d' '{}' \; \
+	-exec sed -i -e '1!b;/^$/d' '{}' \; \
+	-print
