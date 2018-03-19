@@ -26,14 +26,14 @@
 config="${HOME}/.mbsyncrc"
 mail="${HOME}/.mail"
 
-read -p 'Alias: ' name
+read -p 'Alias (use "-" as directory separator): ' name
 read -p 'Server: ' server
 read -p 'Username: ' username
 read -sp 'Password: ' password
 
 mine="${name}-local"
 remote="${name}-remote"
-path="${mail}/${name}"
+path="${mail}/$(echo ${name} | tr "-" "/")"
 inbox="${path}/INBOX"
 
 cat >> $config <<EOF
@@ -61,7 +61,7 @@ SyncState *
 EOF
 
 if [ ! -d $path ]; then
-	mkdir $path
+	mkdir -p $path
 fi
 
 chmod 700 $path
