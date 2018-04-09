@@ -37,7 +37,9 @@ path="${mail}/$(echo ${name} | tr "-" "/")"
 inbox="${path}/INBOX"
 
 cat >> $config <<EOF
-$(echo $name | boxes -d shell -s 40)
+########################################
+# $name
+########################################
 MaildirStore $mine
 Path ${path}/
 Inbox $inbox
@@ -53,9 +55,9 @@ Channel $name
 Master :${remote}:
 Slave :${mine}:
 Patterns *
-Sync PullNew Push
+Sync All
 Create Both
-Expunge Slave
+Expunge Both
 SyncState *
 
 EOF
