@@ -19,7 +19,7 @@ function setup_window() {
 	session=${1:-}
 	window=${2:-}
 
-	if [ "${session}" != "write" ]; then
+	if [ "${session}" != "write" ] && [ "${session}" != "teaching" ]; then
 		tmux split-window -h -t ${session}:${window}.1
 		if [ "${session}" != "mail" ]; then
 			tmux split-window -v -t ${session}:${window}.2
@@ -31,7 +31,13 @@ function setup_window() {
 	elif [ "${session}" == "deploy" ]; then
 		setup_panes "${session}" "${window}" "cd ~/evaluation/${window}"
 	elif [ "${session}" == "write" ]; then
-		setup_panes "${session}" "${window}" "cd ~/paper/${window}"
+		if [ "${window}" == "thesis" ]; then
+			setup_panes "${session}" "${window}" "cd ~/${window}"
+		else
+			setup_panes "${session}" "${window}" "cd ~/paper/${window}"
+		fi
+	elif [ "${session}" == "teaching" ]; then
+		setup_panes "${session}" "${window}" "cd ~/${session}/se/Uebungen_Passau/${window}"
 	fi
 }
 
@@ -58,7 +64,8 @@ setup_session "${hostname}" "root"
 setup_session "mail" "mutt"
 setup_session "code" "jdime" "jdime-testfiles"
 setup_session "deploy" "lookahead"
-setup_session "write" "lookahead"
+setup_session "write" "lookahead" "conflict-prediction" "thesis"
+#setup_session "teaching" "Aufgaben" "SS17"
 
 tmux send-keys -t "${hostname}:root.2" "top" C-m
 tmux send-keys -t "${hostname}:root.3" "journalctl -k -f" C-m
