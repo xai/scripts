@@ -63,14 +63,14 @@ function setup_session() {
 setup_session "${hostname}" "root"
 setup_session "mail" "mutt"
 setup_session "code" "jdime" "jdime-testfiles"
-setup_session "deploy" "lookahead"
-setup_session "write" "lookahead" "conflict-prediction" "thesis"
+#setup_session "deploy" "lookahead"
+setup_session "write" "thesis"
 #setup_session "teaching" "Aufgaben" "SS17"
 
 tmux send-keys -t "${hostname}:root.2" "top" C-m
 tmux send-keys -t "${hostname}:root.3" "journalctl -k -f" C-m
 
-tmux send-keys -t "mail:mutt.1" "offlineimap -u ttyui" C-m
+tmux send-keys -t "mail:mutt.1" "while true; do mbsync inboxes; sleep 60; done" C-m
 tmux send-keys -t "mail:mutt.2" "mutt" C-m
 
 tmux select-pane -t "${hostname}:root.1"
