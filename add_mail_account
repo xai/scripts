@@ -22,6 +22,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+function yes_or_no {
+	while true; do
+		read -p "$* [y/n]: " yn
+		case $yn in
+			[Yy]*) return 0 ;;
+			[Nn]*) return 1 ;;
+		esac
+	done
+}
 
 config="${HOME}/.mbsyncrc"
 mail="${HOME}/.mail"
@@ -30,6 +39,7 @@ read -p 'Alias (use "-" as directory separator): ' name
 read -p 'Server: ' server
 read -p 'Username: ' username
 read -sp 'Password: ' password
+read -p 'Username: ' username
 
 mine="${name}-local"
 remote="${name}-remote"
@@ -71,5 +81,10 @@ chmod 600 $config
 
 sed -i '/^group inboxes.*/d' $config
 egrep '^Channel' $config | awk -F' ' '{ print $2":INBOX" }' | xargs echo group inboxes >> $config
+
+if $(yes_or_no "Read-only sync (one way)?"); then
+	sed -i 's/Create Both/Create Slave/' $config
+	sed -i 's/Expunge Both/Expunge Slave/' $config
+fi
 
 echo
