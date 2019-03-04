@@ -6,20 +6,20 @@ targetpool="$1"
 targetfs=$(hostname -s)
 
 newsnap="home@$(date +%Y%m%d)"
-homesnap=$(zfs list -r -t snapshot -o name home | grep home@ | tail -n1)
+homesnap=$(zfs list -r -t snapshot -H -o name home | grep home@ | tail -n1)
 
 if [ "$newsnap" == "$homesnap" ]; then
 	echo "Found existing snapshot for today: $homesnap"
 else
 	echo "Create snapshot $newsnap"
 	zfs snapshot -r $newsnap
-	homesnap=$(zfs list -r -t snapshot -o name home | grep home@ | tail -n1)
+	homesnap=$(zfs list -r -t snapshot -H -o name home | grep home@ | tail -n1)
 fi
 
 # Ensure that backup pool (${targetpool}) is actually there
 (zpool list -Ho name | grep -q ${targetpool}) || (echo 'Error: Pool ${targetpool} not found!'  && exit 1)
 
-backupsnap=$(zfs list -r -t snapshot -o name ${targetpool}/${targetfs}/home | egrep -o 'home@.+' | tail -n1)
+backupsnap=$(zfs list -r -t snapshot -H -o name ${targetpool}/${targetfs}/home | egrep -o 'home@.+' | tail -n1)
 
 if [ "$homesnap" != "$backupsnap" ];  then
 	echo "zfs send -RI $backupsnap $homesnap | zfs recv -Fu ${targetpool}/${targetfs}/home"
