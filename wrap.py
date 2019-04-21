@@ -24,9 +24,9 @@ def wrap(inputfile, width):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-w", "--width",
-                        help="Width of line",
+                        help="Width of line in characters",
                         type=int)
-    parser.add_argument("inputfile", default=None, nargs="?")
+    parser.add_argument("inputfile", default=None)
     args = parser.parse_args()
 
     wrap(args.inputfile, args.width)
