@@ -39,7 +39,6 @@ read -p 'Alias (use "-" as directory separator): ' name
 read -p 'Server: ' server
 read -p 'Username: ' username
 read -sp 'Password: ' password
-read -p 'Username: ' username
 
 mine="${name}-local"
 remote="${name}-remote"
