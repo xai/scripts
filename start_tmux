@@ -31,13 +31,11 @@ function setup_window() {
 	elif [ "${session}" == "deploy" ]; then
 		setup_panes "${session}" "${window}" "cd ~/evaluation/${window}"
 	elif [ "${session}" == "write" ]; then
-		if [ "${window}" == "thesis" ]; then
-			setup_panes "${session}" "${window}" "cd ~/${window}"
-		else
-			setup_panes "${session}" "${window}" "cd ~/paper/${window}"
-		fi
+		setup_panes "${session}" "${window}" "cd ~/paper/${window}"
 	elif [ "${session}" == "teaching" ]; then
 		setup_panes "${session}" "${window}" "cd ~/${session}/se/Uebungen_Passau/${window}"
+	elif [ "${session}" == "websites" ]; then
+		setup_panes "${session}" "${window}" "cd ~/src/${session}/${window}.wu.ac.at"
 	fi
 }
 
@@ -62,18 +60,22 @@ function setup_session() {
 
 setup_session "${hostname}" "root"
 setup_session "mail" "mutt"
-setup_session "code" "jdime" "jdime-testfiles"
+setup_session "code" "avl/api" "avl/JSON" "mdml" "jdime"
 #setup_session "deploy" "lookahead"
-setup_session "write" "thesis"
+setup_session "write" "hw-dlux" "thesis"
+setup_session "websites" "hybridlux" "fosd20"
+setup_session "log" "work" "tasks" "monitor"
 #setup_session "teaching" "Aufgaben" "SS17"
 
-tmux send-keys -t "${hostname}:root.2" "top" C-m
-tmux send-keys -t "${hostname}:root.3" "journalctl -k -f" C-m
+tmux send-keys -t "log:work.1" "cd ~/work.log" C-m
+tmux send-keys -t "log:work.2" "cd ~/work.log" C-m
+tmux send-keys -t "log:tasks.1" "task" C-m
+tmux send-keys -t "log:monitor.1" "top" C-m
+tmux send-keys -t "log:monitor.2" "journalctl -k -f" C-m
 
-tmux send-keys -t "mail:mutt.1" "while true; do mbsync inboxes; sleep 60; done" C-m
-tmux send-keys -t "mail:mutt.2" "mutt" C-m
+tmux send-keys -t "mail:mutt.1" "mutt" C-m
+tmux select-pane -t "mail:mutt.1"
 
-tmux select-pane -t "${hostname}:root.1"
 tmux select-pane -t "${hostname}:root.1"
 
 tmux attach -t "${hostname}"
