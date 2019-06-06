@@ -25,7 +25,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-w", "--width",
                         help="Width of line in characters",
-                        type=int)
+                        type=int,
+                        default=80)
     parser.add_argument("inputfile", default=None)
     args = parser.parse_args()
 
