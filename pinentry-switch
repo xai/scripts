@@ -1,0 +1,11 @@
+#!/bin/bash
+case $PINENTRY_USER_DATA in
+	gnome)
+		exec /usr/bin/pinentry-gnome3 "$@"
+		;;
+	none)
+		exit 1
+		;;
+	*)
+		exec /usr/bin/pinentry-curses "$@"
+esac
