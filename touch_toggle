@@ -1,0 +1,7 @@
+#!/bin/sh
+k="org.gnome.desktop.peripherals.touchpad send-events"
+if gsettings get $k | grep -q enabled; then
+	gsettings set $k disabled
+else
+	gsettings set $k enabled
+fi
