@@ -1,0 +1,44 @@
+#!/bin/bash
+
+function print_only() {
+	echo "Checking $1"
+}
+
+function spam_check() {
+	tmp=$(mktemp)
+	chmod 600 $tmp
+
+	# SCORE - "12.7/5.0" on success OR "0/0" on error
+	# -c does only check, print score, and set return code (-E)
+	#SCORE=`spamc -c < "$email" > /dev/null 2>&1`
+
+	# this rewrites headers in the mail as well
+	spamc -E < $1 > $tmp
+
+	# EXIT - 1 on spam detection, 0 on not-spam or error 
+	EXIT=$?
+
+	subject="$(egrep -m1 '^Subject:' $1)"
+	id="$(egrep -m1 '^Message-ID:' $1)"
+	status=""
+	if [ "$EXIT" = "1" ] ; then
+		status="spam"
+		mv $tmp $1
+	else
+		status="clean"
+		rm $tmp
+	fi
+	echo "$(date -Is);${status};${id};${subject}"
+}
+
+for f in "$@"; do
+	if [ -f "$f" ]; then
+		#print_only $f
+		spam_check $f
+	elif [ -d "$f" ]; then
+		for email in $(find $f -type f \! -name \.\*); do
+			#print_only $email
+			spam_check $email
+		done
+	fi
+done
