@@ -23,6 +23,8 @@ do
 		date=$(date -d "$date" "+%d. %b %H:%M")
 	fi
 
+	echo -e "${date}\t${sender}\t${subject}"
+
 	notify-send -t 10000 "New mail from ${sender}" "$date\n$subject" --icon=mail-unread
 done
 
