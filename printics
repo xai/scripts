@@ -1,0 +1,2 @@
+#!/bin/sh
+khal printics -f "{start} - {end}{nl}{title}{nl}{nl}{description}" $1
