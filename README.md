@@ -22,3 +22,7 @@ Use the `ProxyJump` directive in ~/.ssh/config to specify a jump host for a mach
 ## git
 ### Removing an entire commit
 `git rebase -p --onto SHA^ SHA`
+
+## vim
+### Copy full path of current file to paste buffer
+`:let @" = expand("%:p")`
