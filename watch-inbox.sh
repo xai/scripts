@@ -8,6 +8,8 @@
 
 set -eu
 
+clear
+
 inotifywait -m -q --format '%w%f' -e create -e moved_to $HOME/.mail/{wu,fim}/*/INBOX/new | while read FILE
 do
 	sender=$(grep -m 1 "^From: " "$FILE" | sed 's/^From: //')
@@ -23,7 +25,7 @@ do
 		date=$(date -d "$date" "+%d. %b %H:%M")
 	fi
 
-	echo -e "${date}\t${sender}\t${subject}"
+	echo -e "$(echo $FILE | cut -d'/' -f 5)\t${date}\t${sender}\t${subject}"
 
 	notify-send -t 10000 "New mail from ${sender}" "$date\n$subject" --icon=mail-unread
 done
