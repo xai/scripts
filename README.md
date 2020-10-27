@@ -26,3 +26,8 @@ Use the `ProxyJump` directive in ~/.ssh/config to specify a jump host for a mach
 ## vim
 ### Copy full path of current file to paste buffer
 `:let @" = expand("%:p")`
+
+### Scroll in vims terminal window
+Enter normal mode in the terminal window: `Ctrl-w N`  
+Now use usual vim commands for moving around, coying, pasting.  
+Exit normal mode as usual with 'i' or 'a'
