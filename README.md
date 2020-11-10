@@ -31,3 +31,10 @@ Use the `ProxyJump` directive in ~/.ssh/config to specify a jump host for a mach
 Enter normal mode in the terminal window: `Ctrl-w N`  
 Now use usual vim commands for moving around, coying, pasting.  
 Exit normal mode as usual with 'i' or 'a'
+
+### tmux
+#### Send command to all panes in current window
+* `Ctrl-b :setw synchronize-panes`
+* Run commands ...
+* `Ctrl-b :setw synchronize-panes`
+
