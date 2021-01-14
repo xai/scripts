@@ -1,6 +1,9 @@
 #!/bin/bash
 
+LOCKFILE="${HOME}/.spam.lock"
 LOGFILE="${HOME}/.spamlog"
+
+lockfile -r 0 ${LOCKFILE} || exit 0
 
 #inboxes="$(find ~/.mail -type d -name INBOX)"
 inboxes="/home/xai/.mail/wu/olesseni/INBOX"
@@ -13,3 +16,5 @@ for inbox in $inboxes; do
 		fi
 	done
 done
+
+rm -f ${LOCKFILE}
