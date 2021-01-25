@@ -19,7 +19,7 @@ function spam_check() {
 	EXIT=$?
 
 	subject="$(egrep -m1 '^Subject:' $1)"
-	id="$(egrep -m1 '^Message-ID:' $1)"
+	id="$(egrep -m1 '^Message-ID:' $1 | sha1sum | cut -d' ' -f1)"
 	status=""
 	if [ "$EXIT" = "1" ] ; then
 		status="spam"

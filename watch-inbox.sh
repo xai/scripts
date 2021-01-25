@@ -15,6 +15,7 @@ do
 	sender=$(grep -m 1 "^From: " "$FILE" | sed 's/^From: //')
 	date=$(grep -m 1 "^Date: " "$FILE" | sed 's/^Date: //')
 	subject=$(grep -m 1 "^Subject: " "$FILE" | sed 's/^Subject: //' | decode_mime.pl)
+	msgid="$(egrep -m1 '^Message-ID:' $FILE | sha1sum | cut -d' ' -f1)"
 
 	today=$(date +%Y-%m-%d)
 	mailday=$(date -d "$date" +%Y-%m-%d)
@@ -27,6 +28,8 @@ do
 
 	echo -e "$(echo $FILE | cut -d'/' -f 5)\t${date}\t${sender}\t${subject}"
 
-	notify-send -t 10000 "New mail from ${sender}" "$date\n$subject" --icon=mail-unread
+	if grep "$msgid" ~/.spamlog | grep -vq "spam"; then
+		notify-send -t 10000 "New mail from ${sender}" "$date\n$subject" --icon=mail-unread
+	fi
 done
 
