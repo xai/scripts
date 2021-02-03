@@ -1,6 +1,6 @@
 #!/bin/sh
 
-set -u
+set -eu
 hostname=$(hostname -s)
 
 function setup_panes() {
@@ -42,8 +42,7 @@ function setup_window() {
 function setup_session() {
 	session=${1:-}
 	shift
-	tmux has-session -t ${session} &> /dev/null
-	if [ $? != 0 ]
+	if ! tmux has-session -t ${session} &> /dev/null
 	then
 		firstwindow=${1:-}
 		shift
@@ -59,22 +58,8 @@ function setup_session() {
 }
 
 setup_session "${hostname}" "root"
-setup_session "mail" "mutt"
-setup_session "code" "avl/api" "avl/JSON" "mdml" "jdime"
-#setup_session "deploy" "lookahead"
-setup_session "write" "hw-dlux" "thesis"
-setup_session "websites" "hybridlux" "fosd20"
-setup_session "log" "work" "tasks" "monitor"
-#setup_session "teaching" "Aufgaben" "SS17"
-
-tmux send-keys -t "log:work.1" "cd ~/work.log" C-m
-tmux send-keys -t "log:work.2" "cd ~/work.log" C-m
-tmux send-keys -t "log:tasks.1" "task" C-m
-tmux send-keys -t "log:monitor.1" "top" C-m
-tmux send-keys -t "log:monitor.2" "journalctl -k -f" C-m
-
-tmux send-keys -t "mail:mutt.1" "mutt" C-m
-tmux select-pane -t "mail:mutt.1"
+setup_session "code" "avl/mdml"
+setup_session "write" "hw-dlux"
 
 tmux select-pane -t "${hostname}:root.1"
 

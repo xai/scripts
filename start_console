@@ -51,6 +51,8 @@ function setup_session() {
 }
 
 setup_session "console" "mail" "tasks" "top" "music"
+tmux -L console -f ~/.tmux-alternative.conf -t irc &> /dev/null
+tmux -L console -f ~/.tmux-alternative.conf -t bash &> /dev/null
 
 tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:tasks.1" "task" C-m
 
@@ -61,6 +63,5 @@ tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.4" "journa
 
 tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:mail.1" "mutt" C-m
 tmux -L console -f ~/.tmux-alternative.conf select-pane -t "console:mail.1"
-
 
 tmux -L console -f ~/.tmux-alternative.conf attach -t "console"
