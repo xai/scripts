@@ -11,7 +11,9 @@ inboxes="$HOME/.mail/wu/olesseni/INBOX $HOME/.mail/fim/lessenic/INBOX"
 for inbox in $inboxes; do
 	for msg in $(find ${inbox}/new -type f); do
 		id="$(egrep -m1 '^Message-ID:' $msg | sha1sum | cut -d' ' -f1)"
-		if [ ! -f $LOGFILE ] || [ "$id" != "" ] && ! grep -q 'X-Spam-Status: Yes' $msg; then
+		if [ ! -f $LOGFILE ] || ! grep -q 'X-Spam-Status: Yes' $msg \
+			&& [ "$id" != "" ] \
+			&& ! grep -q "clean;$id" $LOGFILE; then
 			spamcheck ${msg} >> $LOGFILE
 		fi
 	done

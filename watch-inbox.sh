@@ -10,7 +10,7 @@ set -eu
 
 clear
 
-inotifywait -m -q --format '%w%f' -e create -e moved_to $HOME/.mail/{wu,fim}/*/INBOX/new | while read FILE
+inotifywait -m -q --format '%w%f' -e create -e moved_to $HOME/.mail/wu/*/INBOX/new | while read FILE
 do
 	sender=$(grep -m 1 "^From: " "$FILE" | sed 's/^From: //')
 	date=$(grep -m 1 "^Date: " "$FILE" | sed 's/^Date: //')
@@ -28,7 +28,7 @@ do
 
 	echo -e "$(echo $FILE | cut -d'/' -f 5)\t${date}\t${sender}\t${subject}"
 
-	if grep "$msgid" ~/.spamlog | grep -vq "spam"; then
+	if ! grep -q 'X-Spam-Status: Yes' $FILE; then
 		notify-send -t 10000 "New mail from ${sender}" "$date\n$subject" --icon=mail-unread
 	fi
 done
