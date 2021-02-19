@@ -40,13 +40,13 @@ else
 		echo "Last current $snaptype snapshot already synced."
 	else
 		echo
-		echo "zfs send -RI $lastcommon $current | bzip2 -c | $SSH \"bzcat | zfs recv -Fu ${targetfs}\""
+		echo "zfs send -RI $lastcommon $current | bzip2 -c | $SSH \"bzcat | zfs recv -u ${targetfs}\""
 		read -p "Are you sure? " -r
 
 		echo
 		if [[ $REPLY =~ ^[Yy]$ ]]
 		then
-			zfs send -RI $lastcommon $current | bzip2 -c | $SSH "bzcat | zfs recv -Fu ${targetfs}"
+			zfs send -RI $lastcommon $current | bzip2 -c | $SSH "bzcat | zfs recv -u ${targetfs}"
 		else
 			echo "Aborted by user."
 		fi
