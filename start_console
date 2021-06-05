@@ -19,10 +19,10 @@ function setup_window() {
 	session=${1:-}
 	window=${2:-}
 
-	if [ "${window}" != "mail" -a "${window}" != "music" ]; then
+	if [ "${window}" != "mail" -a "${window}" != "music" -a "${window}" != "top" ]; then
 		tmux -L console -f ~/.tmux-alternative.conf split-window -h -t ${session}:${window}.1
 
-		if [ "${window}" == "top" ]; then
+		if [ "${window}" == "logs" ]; then
 			tmux -L console -f ~/.tmux-alternative.conf split-window -v -t ${session}:${window}.1
 			tmux -L console -f ~/.tmux-alternative.conf split-window -v -t ${session}:${window}.3
 		else
@@ -50,16 +50,17 @@ function setup_session() {
 	fi
 }
 
-setup_session "console" "mail" "tasks" "top" "music"
+setup_session "console" "mail" "tasks" "logs" "top" "music"
 tmux -L console -f ~/.tmux-alternative.conf -t irc &> /dev/null
 tmux -L console -f ~/.tmux-alternative.conf -t bash &> /dev/null
 
 tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:tasks.1" "task" C-m
 
-tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.1" "watch-inbox.sh" C-m
-tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.2" "synclog" C-m
-tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.3" "top" C-m
-tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.4" "journalctl -k -f" C-m
+tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:logs.1" "watch-inbox.sh" C-m
+tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:logs.2" "synclog" C-m
+tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:logs.3" "tail -f ~/.spamlog | cut -d';' --complement -f3" C-m
+tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:logs.4" "journalctl -k -f" C-m
+tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:top.1" "top" C-m
 
 tmux -L console -f ~/.tmux-alternative.conf send-keys -t "console:mail.1" "mutt" C-m
 tmux -L console -f ~/.tmux-alternative.conf select-pane -t "console:mail.1"
