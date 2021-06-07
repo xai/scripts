@@ -38,3 +38,9 @@ Exit normal mode as usual with 'i' or 'a'
 * Run commands ...
 * `Ctrl-b :setw synchronize-panes`
 
+### mutt
+
+#### Send calendar invitation that is recognized by thunderbird or outlook
+* Copy ics content into mail body
+* Before sending, use `ctrl+t` to change content-type to `text/calendar` and add `method=REQUEST`
+
