@@ -19,7 +19,7 @@ function setup_window() {
 	session=${1:-}
 	window=${2:-}
 
-	if [ "${window}" != "mail" -a "${window}" != "music" -a "${window}" != "top" ]; then
+	if [ "${window}" != "mail" -a "${window}" != "misc" -a "${window}" != "top" ]; then
 		tmux -L console -f ~/.tmux-alternative.conf split-window -h -t ${session}:${window}.1
 
 		if [ "${window}" == "logs" ]; then
@@ -50,7 +50,7 @@ function setup_session() {
 	fi
 }
 
-setup_session "console" "mail" "tasks" "logs" "top" "music"
+setup_session "console" "mail" "tasks" "logs" "top" "misc"
 tmux -L console -f ~/.tmux-alternative.conf -t irc &> /dev/null
 tmux -L console -f ~/.tmux-alternative.conf -t bash &> /dev/null
 
