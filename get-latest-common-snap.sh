@@ -18,4 +18,4 @@ echo "${1}${srclatest}"
 echo "${2}${targetlatest}"
 echo "Common: "$common""
 
-echo "zfs -RI send ${1}${common} ${1}${srclatest} | zfs recv -u ${2}"
+echo "zfs send -RI ${1}${common} ${1}${srclatest} | zfs recv -u ${2}"
