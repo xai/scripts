@@ -10,7 +10,7 @@ set -eu
 
 srcsnaps="$(zfs list -t snapshot -o name -H $1 | sed 's_.\+@_@_')"
 targetsnaps="$(zfs list -t snapshot -o name -H $2 | sed 's_.\+@_@_')"
-common="$(comm -12 --nocheck-order <(echo "$srcsnaps") <(echo "$targetsnaps") | tail -n1)"
+common="$(grep -Fxf <(echo "$srcsnaps") <(echo "$targetsnaps") | tail -n1)"
 srclatest="$(echo "$srcsnaps" | tail -n1)"
 targetlatest="$(echo "$targetsnaps" | tail -n1)"
 
