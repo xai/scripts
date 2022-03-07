@@ -63,6 +63,22 @@ Exit normal mode as usual with 'i' or 'a'
 * Copy ics content into mail body
 * Before sending, use `ctrl+t` to change content-type to `text/calendar` and add `method=REQUEST`
 
+#### Handle html-only mails
+In mailcap file (see `muttrc:` `set mailcap_path = /path/to/mailcap`):
+```
+text/html; w3m -I %{charset} -T text/html; copiousoutput;
+```
+
+In `muttrc` or on demand:
+```
+auto_view text/html
+```
+
+If you put in in `muttrc`, also add
+```
+alternative_order text/plain text/enriched text/html
+```
+
 ### udev
 
 #### Disable internal webcam
