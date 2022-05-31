@@ -1,0 +1,24 @@
+#!/bin/bash
+
+LOCKFILE="`basename $0`.lock"
+
+# Timeout in seconds.
+TIMEOUT=2
+
+touch $LOCKFILE
+
+# Create a file descriptor over the given lockfile.
+exec {FD}<>$LOCKFILE
+
+# Try to lock the file descriptor $FD during $TIMEOUT seconds.
+# If it failsm exit with an error.
+# Otherwise, the lock is acquired and implicitely droped at the end of the script.
+if ! flock -x -w $TIMEOUT $FD; then
+	echo "Failed to obtain a lock within $TIMEOUT seconds"
+	echo "Another instance of `basename $0` is probably running."
+	exit 1
+else
+	echo "Lock acquired"
+	khard --skip-unparsable email | awk -F'\t' -vOFS='\t' 'NR > 1 {gsub(/  +/, "\t"); print $3,$1,$2}' > ~/.mutt/address_index_from_vcards
+fi
+

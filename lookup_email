@@ -1,0 +1,4 @@
+#!/bin/bash
+echo 'Searching...'
+non_seq="$(<<<"$@" sed -r 's/(.)/\1([^ ]* )*/g')"
+awk -F'\t' -vIGNORECASE=1 -vVAR="$non_seq" '$2 ~ VAR' ~/.mutt/address_index_from_vcards
