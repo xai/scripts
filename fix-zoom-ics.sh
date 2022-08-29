@@ -8,7 +8,7 @@
 
 if grep -q 'BEGIN:VTIMEZONE' $1
 then
-	>2 echo "VTIMEZONE already present. Quitting."
+	>&2 echo "VTIMEZONE already present. Quitting."
 	return 0
 fi
 
