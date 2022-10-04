@@ -1,0 +1,18 @@
+#!/bin/bash
+
+set -eu
+
+DB="$HOME/.local/share/hamster-applet/hamster.db"
+DEFAULTDST="$HOME/Documents/$(date +%Y%m%d)-hamster-full-export"
+DST="${1:-$DEFAULTDST}"
+
+if [ ! -f "$DB" ]
+then
+	>&2 echo "hamster database not found at: $DB"
+	exit 1
+fi
+
+sqlite3 $DB 'SELECT f.start_time, f.end_time, a.name, group_concat(t.name), f.description FROM facts AS f LEFT OUTER join activities AS a ON f.activity_id = a.id LEFT OUTER JOIN fact_tags AS ft ON ft.fact_id = f.id LEFT OUTER JOIN tags AS t ON ft.tag_id = t.id GROUP BY f.start_time; ' | tee $DST
+
+echo
+echo "Exported $(wc -l $DST | cut -d' ' -f1) entries to file $DST."
