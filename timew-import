@@ -10,8 +10,9 @@ do
 	end="${end/ /T}"
 	echo "timew track ${start} - ${end} $project"
 	timew track ${start} - ${end} $project
-	if [ ! -z "$description" ]; then
-		echo "timew annotate @1 \"${tags} ${description}\""
-		timew annotate @1 "${tags} ${description}"
+	if [ ! -z "${tags}${description}" ]; then
+		annotation="$(echo "${tags} ${description}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+		echo "timew annotate @1 \"${annotation}\""
+		timew annotate @1 "${annotation}"
 	fi
 done < $infile
