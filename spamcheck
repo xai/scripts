@@ -1,5 +1,8 @@
 #!/bin/bash
 
+BACKUP_DIR=${HOME}/.mail/bak
+mkdir -p $BACKUP_DIR
+
 function print_only() {
 	echo "Checking $1"
 }
@@ -23,6 +26,7 @@ function spam_check() {
 	status=""
 	if [ "$EXIT" = "1" ] ; then
 		status="spam"
+		cp $1 $BACKUP_DIR/
 		mv $tmp $1
 	else
 		status="clean"
