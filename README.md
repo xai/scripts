@@ -4,11 +4,23 @@ Just a collection of various scripts.
 ## Random snippets I looked up sometime and will probably need again
 
 ### firewalld
+
+#### List zones / manage interfaces
+
 List active zones: `firewall-cmd --get-active-zones`  
+Remove an interface from a zone: `firewall-cmd --zone=zone-name --remove-interface=dev-name`  
+Add an interface to a zone: `firewall-cmd --zone=zone-name --add-interface=dev-name`  
+If the interface is controlled by NetworkManager, use `nm-connection-editor` to set the zone permanently.
+
+#### Enable and disable ports
+
 List open services/ports/others: `firewall-cmd --list-all`  
-Temporary allow a port: `firewall-cmd --add-port=port-number/port-type`  
-Make changes permanent: `firewall-cmd --runtime-to-permanent`  
+Allow a port in a zone: `firewall-cmd --zone=zone-name --add-port=port-number/port-type`  
 Removing a port is done analogously with --remove-port.
+
+#### Making changes permanent
+By default, the above changes are temporarily.  
+To make changes permanent, run `firewall-cmd --runtime-to-permanent`  
 
 ### Spawn a simple webserver to share files
 `python3 -m http.server 8080`
