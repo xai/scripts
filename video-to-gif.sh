@@ -16,5 +16,6 @@ if [ -f "$outfile" ]; then
 	exit 2
 fi
 
-ffmpeg -y -i "$infile" -filter_complex "fps=10,split[v1][v2]; [v1]palettegen=stats_mode=full [palette]; [v2][palette]paletteuse=dither=sierra2_4a" -vsync 0 "$outfile"
+# ffmpeg -y -i "$infile" -filter_complex "fps=10,split[v1][v2]; [v1]palettegen=stats_mode=full [palette]; [v2][palette]paletteuse=dither=sierra2_4a" -vsync 0 "$outfile"
+ffmpeg -y -i "$infile" -filter_complex "fps=9,split[v1][v2]; [v1]palettegen=stats_mode=full [palette]; [v2][palette]paletteuse=dither=sierra2_4a" -vsync 0 "$outfile"
 

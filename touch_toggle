@@ -1,7 +1,20 @@
-#!/bin/sh
-k="org.gnome.desktop.peripherals.touchpad send-events"
-if gsettings get $k | grep -q enabled; then
-	gsettings set $k disabled
-else
-	gsettings set $k enabled
-fi
+#!/bin/bash
+# k="org.gnome.desktop.peripherals.touchpad send-events"
+# if gsettings get $k | grep -q enabled; then
+# 	gsettings set $k disabled
+# else
+# 	gsettings set $k enabled
+# fi
+
+# toggle touchpad using xinput
+function touchpad_toggle() {
+	local id=$(xinput list | grep -i touchpad | grep -o 'id=[0-9]*' | grep -o '[0-9]*')
+	local state=$(xinput list-props $id | grep 'Device Enabled' | grep -o '[01]$')
+	if [ $state -eq 1 ]; then
+		xinput --disable $id
+	else
+		xinput --enable $id
+	fi
+}
+
+touchpad_toggle
