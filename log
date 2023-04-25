@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# wrapper script for tee to log output to a file
+# Usage: | log <timestamp>
+
+LOGDIR=${HOME}/logs
+TIMEFILE=${LOGDIR}/timefile
+
+mkdir -p $LOGDIR
+
+if [ -z "$1" ]; then
+	timestamp=$(cat ${TIMEFILE})
+elif [ "$1" = "now" ]; then
+	timestamp=$(date +%Y%m%d_%H%M%S)
+	echo ${timestamp} > ${TIMEFILE}
+else
+	timestamp=$1
+fi
+
+cwd=$(realpath --relative-to $HOME . | sed 's/\//_/g')
+dst="${LOGDIR}/${cwd}/${timestamp}.log"
+
+if [ ! -d $(dirname ${dst}) ]; then
+	mkdir -p $(dirname ${dst})
+fi
+
+tee ${dst}
