@@ -56,3 +56,17 @@ Exit normal mode as usual with 'i' or 'a'
 * Copy ics content into mail body
 * Before sending, use `ctrl+t` to change content-type to `text/calendar` and add `method=REQUEST`
 
+### udev
+
+#### Disable internal webcam
+
+Easy, thanks to Rob Hoelz! See his blog post for details on this: https://hoelz.ro/blog/using-udev-to-disable-my-infrared-camera-on-linux.
+
+Add `/etc/udev/rules.d/99-disable-internal-webcam.rules` with content:
+
+```
+ACTION!="add|change", GOTO="camera_end"
+ATTRS{idVendor}=="xxxx",ATTRS{idProduct}=="yyyy",ATTR{bConfigurationValue}="0"
+LABEL="camera_end"
+```
+
