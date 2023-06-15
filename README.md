@@ -70,3 +70,16 @@ ATTRS{idVendor}=="xxxx",ATTRS{idProduct}=="yyyy",ATTR{bConfigurationValue}="0"
 LABEL="camera_end"
 ```
 
+### Gnome shell
+
+Restart an unresponsive and broken gnome-shell session:
+```
+killall -HUP gnome-shell
+```
+
+According to stackoverflow, 
+```
+busctl --user call org.gnome.Shell /org/gnome/Shell org.gnome.Shell Eval s 'Meta.restart("Restarting…")'
+```
+should be equivalent to Alt+F2 `restart`, but did not help in my case and just timeouted.
+
