@@ -90,3 +90,8 @@ busctl --user call org.gnome.Shell /org/gnome/Shell org.gnome.Shell Eval s 'Meta
 ```
 should be equivalent to Alt+F2 `restart`, but did not help in my case and just timeouted.
 
+### dpkg
+#### Installation/removal scripts (e.g., preinst, postrm, ...) failed
+When dpkg handles a package, the scripts are temporarily stored in e.g., `/var/lib/dpkg/info/mypkg.postrm`.
+As a quick workaround, you can inspect them, change them, or simply remove them before re-executing the action.
+
