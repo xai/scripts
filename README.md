@@ -35,6 +35,13 @@ Use the `ProxyJump` directive in ~/.ssh/config to specify a jump host for a mach
 #### Removing an entire commit
 `git rebase -p --onto SHA^ SHA`
 
+#### Handle encrypted files
+```
+git config diff.gpg.textconv "gpg2 --decrypt -q"
+echo "*.gpg filter=gpg diff=gpg" >> .gitattributes
+echo "*.asc filter=gpg diff=gpg" >> .gitattributes
+```
+
 ### vim
 #### Copy full path of current file to paste buffer
 `:let @" = expand("%:p")`
