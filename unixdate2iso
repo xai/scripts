@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -e
+
+# Replace all unix timestamps that appear somewhere in a line from STDIN to human readable date
+
+while IFS= read -r line; do
+	timestamp=$(echo "$line" | grep -o '[0-9]\{10\}' || true)
+	if [ -n "$timestamp" ]; then
+		iso=$(date -d "@$timestamp" "+%Y%m%d-%H%M")
+		echo "$line" | sed "s_${timestamp}_${iso}_"
+	else
+		echo "$line"
+	fi
+done
+
