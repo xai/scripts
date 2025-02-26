@@ -1,0 +1,35 @@
+#!/bin/bash
+
+if ! command -v xclip &>/dev/null; then
+    echo "Error: xclip is not installed. Install it using your package manager." >&2
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    COMMANDS=$(xclip -o -sel clip)
+else
+    COMMANDS="$*"
+fi
+
+CLIPBOARD_CONTENT="\`\`\`\n"
+
+while IFS= read -r CMD; do
+    if [ -n "$CMD" ]; then
+        echo "\$ $CMD"
+        OUTPUT="$($CMD 2>&1)\n"
+        echo "$OUTPUT"
+
+        CLIPBOARD_CONTENT+=$(cat <<EOF
+\$ $CMD
+$OUTPUT
+EOF
+        )
+    fi
+done <<< "$COMMANDS"
+
+CLIPBOARD_CONTENT+="\`\`\`"
+
+echo -e "$CLIPBOARD_CONTENT" | xclip -sel clip
+
+echo "Command output copied to clipboard."
+
