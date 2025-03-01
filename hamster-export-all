@@ -2,7 +2,7 @@
 
 set -eu
 
-DB="$HOME/.local/share/hamster-applet/hamster.db"
+DB="$HOME/.local/share/hamster/hamster.db"
 DEFAULTDST="$HOME/Documents/$(date +%Y%m%d)-hamster-full-export"
 DST="${1:-$DEFAULTDST}"
 
