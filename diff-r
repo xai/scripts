@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# usage: $0 dir1 dir2
+
+function usage {
+    echo "Usage: $0 dir1 dir2"
+    exit 1
+}
+
+function compare_files {
+    # git diff --no-index --color-words "$1" "$2"
+    git diff --no-index "$1" "$2"
+}
+
+if [ $# -ne 2 ]; then
+    usage
+fi
+
+diff -rq $1 $2 \
+    | awk '/differ$/ {print $2, $4}' \
+    | while read file1 file2
+do
+    echo "Comparing $file1 and $file2"
+    compare_files "$file1" "$file2"
+done
