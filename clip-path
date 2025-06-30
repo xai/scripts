@@ -1,0 +1,15 @@
+#!/bin/bash
+
+if [ $# -eq 0 ]; then
+    echo "Usage: clip-path <file>" >&2
+    exit 1
+fi
+
+if [ ! -e "$1" ]; then
+    echo "Error: File '$1' does not exist" >&2
+    exit 1
+fi
+
+realpath_result=$(realpath "$1")
+echo "$realpath_result" | xclip -sel clip
+echo "$realpath_result"
