@@ -1,0 +1,358 @@
+#!/bin/bash
+
+set -e
+
+usage() {
+    cat << EOF
+Usage: wt <command> [options]
+
+Commands:
+    list      List all worktrees (with lock status)
+    locked    List only locked worktrees
+    cleanup   Remove all locked worktrees
+    lock      Lock worktree(s): wt lock <path> [path2 ...]
+    unlock    Unlock worktree(s): wt unlock <path> [path2 ...]
+    run       Run command in worktrees: wt run [--locked|--all] -- <command>
+    help      Show this help
+
+Examples:
+    wt list
+    wt locked
+    wt cleanup
+    wt lock /path/to/worktree
+    wt unlock /path/to/worktree
+    wt lock /path/worktree-* /other/worktree
+    wt unlock */worktree-{1,2}
+    wt run -- git clean -dfx
+    wt run --locked -- git status
+    wt run --all -- npm install
+EOF
+}
+
+require_repo() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Error: Not in a git repository" >&2
+        exit 1
+    fi
+}
+
+get_worktrees() {
+    git worktree list --porcelain | awk '
+    function emit() {
+        if (path != "") {
+            printf "%s\t%d\n", path, locked;
+        }
+    }
+    BEGIN {
+        path = "";
+        locked = 0;
+    }
+    {
+        key = $1;
+        if (key == "worktree") {
+            emit();
+            path = substr($0, index($0, " ") + 1);
+            locked = 0;
+        } else if (key == "locked") {
+            locked = 1;
+        } else if ($0 == "") {
+            emit();
+            path = "";
+            locked = 0;
+        }
+    }
+    END {
+        emit();
+    }'
+}
+
+list_worktrees() {
+    require_repo
+    
+    git worktree list
+}
+
+list_locked() {
+    require_repo
+
+    local found=0
+    while IFS=$'\t' read -r formatted path locked_flag; do
+        if [ "$locked_flag" -eq 1 ]; then
+            echo "$formatted"
+            found=1
+        fi
+    done < <(paste <(git worktree list) <(get_worktrees))
+
+    if [ "$found" -eq 0 ]; then
+        echo "No locked worktrees found"
+    fi
+}
+
+cleanup_locked() {
+    require_repo
+
+    local locked_worktrees=()
+    while IFS=$'\t' read -r path status; do
+        if [ "$status" -eq 1 ]; then
+            locked_worktrees+=("$path")
+        fi
+    done < <(get_worktrees)
+
+    if [ ${#locked_worktrees[@]} -eq 0 ]; then
+        echo "No locked worktrees found"
+        return 0
+    fi
+
+    echo "Found locked worktrees:"
+    printf '  %s\n' "${locked_worktrees[@]}"
+    echo
+
+    read -p "Remove all locked worktrees? [y/N]: " -n 1 -r
+    echo
+
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        for worktree_path in "${locked_worktrees[@]}"; do
+            echo "Removing: $worktree_path"
+            git worktree remove -f -f "$worktree_path" --force
+        done
+        echo "Cleanup complete"
+    else
+        echo "Cleanup cancelled"
+    fi
+}
+
+lock_worktree() {
+    require_repo
+
+    if [ $# -eq 0 ]; then
+        echo "Error: Please specify at least one worktree path" >&2
+        exit 1
+    fi
+
+    declare -A worktree_status
+    while IFS=$'\t' read -r wt_path status; do
+        worktree_status["$wt_path"]="$status"
+    done < <(get_worktrees)
+
+    local paths_to_lock=()
+    for path in "$@"; do
+        if [ ! -d "$path" ]; then
+            echo "Warning: Skipping non-existent path: $path" >&2
+        else
+            local abs_path
+            abs_path=$(cd "$path" && pwd)
+
+            if [ "${worktree_status[$abs_path]}" = "1" ]; then
+                echo "Already locked: $path"
+            elif [ -n "${worktree_status[$abs_path]+_}" ]; then
+                paths_to_lock+=("$path")
+            else
+                echo "Warning: Not a worktree: $path" >&2
+            fi
+        fi
+    done
+
+    if [ ${#paths_to_lock[@]} -eq 0 ]; then
+        echo "No worktrees to lock"
+        exit 0
+    fi
+
+    if [ ${#paths_to_lock[@]} -gt 1 ]; then
+        echo "About to lock ${#paths_to_lock[@]} worktree(s):"
+        printf '  %s\n' "${paths_to_lock[@]}"
+        echo
+        read -p "Continue? [y/N]: " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled"
+            exit 0
+        fi
+    fi
+
+    for path in "${paths_to_lock[@]}"; do
+        git worktree lock "$path"
+        echo "Locked: $path"
+    done
+}
+
+unlock_worktree() {
+    require_repo
+
+    if [ $# -eq 0 ]; then
+        echo "Error: Please specify at least one worktree path" >&2
+        exit 1
+    fi
+
+    declare -A worktree_status
+    while IFS=$'\t' read -r wt_path status; do
+        worktree_status["$wt_path"]="$status"
+    done < <(get_worktrees)
+
+    local paths_to_unlock=()
+    for path in "$@"; do
+        if [ ! -d "$path" ]; then
+            echo "Warning: Skipping non-existent path: $path" >&2
+        else
+            local abs_path
+            abs_path=$(cd "$path" && pwd)
+
+            if [ "${worktree_status[$abs_path]}" = "0" ]; then
+                echo "Not locked: $path"
+            elif [ "${worktree_status[$abs_path]}" = "1" ]; then
+                paths_to_unlock+=("$path")
+            else
+                echo "Warning: Not a worktree: $path" >&2
+            fi
+        fi
+    done
+
+    if [ ${#paths_to_unlock[@]} -eq 0 ]; then
+        echo "No worktrees to unlock"
+        exit 0
+    fi
+
+    if [ ${#paths_to_unlock[@]} -gt 1 ]; then
+        echo "About to unlock ${#paths_to_unlock[@]} worktree(s):"
+        printf '  %s\n' "${paths_to_unlock[@]}"
+        echo
+        read -p "Continue? [y/N]: " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled"
+            exit 0
+        fi
+    fi
+
+    for path in "${paths_to_unlock[@]}"; do
+        git worktree unlock "$path"
+        echo "Unlocked: $path"
+    done
+}
+
+run_in_worktrees() {
+    require_repo
+
+    local mode="unlocked"
+    local command_args=()
+    local found_separator=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --locked)
+                mode="locked"
+                shift
+                ;;
+            --all)
+                mode="all"
+                shift
+                ;;
+            --)
+                found_separator=true
+                shift
+                command_args=("$@")
+                break
+                ;;
+            *)
+                echo "Error: Unknown option '$1'. Use -- to separate command" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$found_separator" = false ]; then
+        echo "Error: Missing -- separator before command" >&2
+        echo "Usage: wt run [--locked|--all] -- <command>" >&2
+        exit 1
+    fi
+
+    if [ ${#command_args[@]} -eq 0 ]; then
+        echo "Error: No command specified after --" >&2
+        exit 1
+    fi
+
+    local worktree_paths=()
+    while IFS=$'\t' read -r wt_path status; do
+        case "$mode" in
+            locked)
+                [ "$status" -eq 1 ] && worktree_paths+=("$wt_path")
+                ;;
+            unlocked)
+                [ "$status" -eq 0 ] && worktree_paths+=("$wt_path")
+                ;;
+            all)
+                worktree_paths+=("$wt_path")
+                ;;
+        esac
+    done < <(get_worktrees)
+
+    if [ ${#worktree_paths[@]} -eq 0 ]; then
+        echo "No $mode worktrees found"
+        exit 0
+    fi
+
+    echo "About to run command in ${#worktree_paths[@]} $mode worktree(s):"
+    printf '  %s\n' "${worktree_paths[@]}"
+    echo
+    echo "Command: ${command_args[*]}"
+    echo
+    read -p "Continue? [y/N]: " -n 1 -r
+    echo
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled"
+        exit 0
+    fi
+
+    local failed=0
+    for wt_path in "${worktree_paths[@]}"; do
+        echo
+        echo "==> Running in: $wt_path"
+        if (cd "$wt_path" && "${command_args[@]}"); then
+            echo "==> Success: $wt_path"
+        else
+            echo "==> Failed: $wt_path (exit code: $?)" >&2
+            ((failed++))
+        fi
+    done
+
+    echo
+    if [ $failed -eq 0 ]; then
+        echo "All commands completed successfully"
+    else
+        echo "Warning: $failed command(s) failed" >&2
+        exit 1
+    fi
+}
+
+case "${1:-help}" in
+    list|ls)
+        list_worktrees
+        ;;
+    locked)
+        list_locked
+        ;;
+    cleanup|clean)
+        cleanup_locked
+        ;;
+    lock)
+        shift
+        lock_worktree "$@"
+        ;;
+    unlock)
+        shift
+        unlock_worktree "$@"
+        ;;
+    run|exec)
+        shift
+        run_in_worktrees "$@"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        echo "Error: Unknown command '$1'" >&2
+        echo
+        usage
+        exit 1
+        ;;
+esac
