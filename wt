@@ -13,6 +13,7 @@ Commands:
     locked    List only locked worktrees
     cleanup   Remove all locked worktrees
     lock      Lock worktree(s): wt lock <path> [path2 ...]
+              --clean        Lock all clean worktrees with remote (except primary)
     unlock    Unlock worktree(s): wt unlock <path> [path2 ...]
     run       Run command in worktrees: wt run [--locked|--all] -- <command>
     help      Show this help
@@ -23,6 +24,7 @@ Examples:
     wt list
     wt locked
     wt cleanup
+    wt lock --clean
     wt lock /path/to/worktree
     wt unlock /path/to/worktree
     wt lock /path/worktree-* /other/worktree
@@ -244,7 +246,13 @@ cleanup_locked() {
 lock_worktree() {
     require_repo
 
-    if [ $# -eq 0 ]; then
+    local clean_mode=0
+    if [ "${1:-}" = "--clean" ]; then
+        clean_mode=1
+        shift
+    fi
+
+    if [ $clean_mode -eq 0 ] && [ $# -eq 0 ]; then
         echo "Error: Please specify at least one worktree path" >&2
         exit 1
     fi
@@ -255,29 +263,66 @@ lock_worktree() {
     done < <(get_worktrees)
 
     local paths_to_lock=()
-    for path in "$@"; do
-        if [ ! -d "$path" ]; then
-            echo "Warning: Skipping non-existent path: $path" >&2
-        else
-            local abs_path
-            abs_path=$(cd "$path" && pwd)
 
-            if [ "${worktree_status[$abs_path]}" = "1" ]; then
-                echo "Already locked: $path"
-            elif [ -n "${worktree_status[$abs_path]+_}" ]; then
-                paths_to_lock+=("$path")
-            else
-                echo "Warning: Not a worktree: $path" >&2
+    if [ $clean_mode -eq 1 ]; then
+        local primary_worktree
+        primary_worktree=$(git worktree list --porcelain | awk '/^worktree / {print substr($0, 10); exit}')
+
+        while IFS=$'\t' read -r wt_path locked; do
+            if [ "$wt_path" = "$primary_worktree" ]; then
+                continue
             fi
-        fi
-    done
+
+            if [ "$locked" -eq 1 ]; then
+                continue
+            fi
+
+            (
+                cd "$wt_path" || exit 1
+
+                local upstream
+                upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+                if [ -z "$upstream" ]; then
+                    exit 1
+                fi
+
+                local staged unstaged untracked
+                staged=$(git diff --cached --numstat 2>/dev/null | wc -l)
+                unstaged=$(git diff --numstat 2>/dev/null | wc -l)
+                untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
+
+                if [ "$staged" -eq 0 ] && [ "$unstaged" -eq 0 ] && [ "$untracked" -eq 0 ]; then
+                    exit 0
+                else
+                    exit 1
+                fi
+            ) && paths_to_lock+=("$wt_path")
+        done < <(get_worktrees)
+    else
+        for path in "$@"; do
+            if [ ! -d "$path" ]; then
+                echo "Warning: Skipping non-existent path: $path" >&2
+            else
+                local abs_path
+                abs_path=$(cd "$path" && pwd)
+
+                if [ "${worktree_status[$abs_path]}" = "1" ]; then
+                    echo "Already locked: $path"
+                elif [ -n "${worktree_status[$abs_path]+_}" ]; then
+                    paths_to_lock+=("$path")
+                else
+                    echo "Warning: Not a worktree: $path" >&2
+                fi
+            fi
+        done
+    fi
 
     if [ ${#paths_to_lock[@]} -eq 0 ]; then
         echo "No worktrees to lock"
         exit 0
     fi
 
-    if [ ${#paths_to_lock[@]} -gt 1 ]; then
+    if [ ${#paths_to_lock[@]} -gt 1 ] || [ $clean_mode -eq 1 ]; then
         echo "About to lock ${#paths_to_lock[@]} worktree(s):"
         printf '  %s\n' "${paths_to_lock[@]}"
         echo
