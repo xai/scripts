@@ -7,6 +7,8 @@ usage() {
 Usage: wt <command> [options]
 
 Commands:
+    status    Show clean status overview of all worktrees
+              -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
     locked    List only locked worktrees
     cleanup   Remove all locked worktrees
@@ -16,6 +18,8 @@ Commands:
     help      Show this help
 
 Examples:
+    wt status
+    wt status -v
     wt list
     wt locked
     wt cleanup
@@ -85,6 +89,120 @@ list_locked() {
 
     if [ "$found" -eq 0 ]; then
         echo "No locked worktrees found"
+    fi
+}
+
+status_worktrees() {
+    require_repo
+
+    local verbose=0
+    if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--verbose" ]; then
+        verbose=1
+    fi
+
+    local RED='\033[0;31m'
+    local GREEN='\033[0;32m'
+    local YELLOW='\033[1;33m'
+    local BLUE='\033[0;34m'
+    local CYAN='\033[0;36m'
+    local GRAY='\033[0;90m'
+    local BOLD='\033[1m'
+    local RESET='\033[0m'
+
+    local worktree_count=0
+    while IFS=$'\t' read -r wt_path locked; do
+        ((++worktree_count))
+
+        local wt_name
+        wt_name=$(basename "$wt_path")
+        if [ "$locked" -eq 1 ]; then
+            echo -e "${BOLD}${YELLOW}🔒 $wt_name${RESET} ${GRAY}(locked)${RESET}"
+        else
+            echo -e "${BOLD}${CYAN}$wt_name${RESET}"
+        fi
+        echo -e "${GRAY}   $wt_path${RESET}"
+
+        (
+            cd "$wt_path" || exit 0
+
+            local branch
+            branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            echo -e "   ${BLUE}branch:${RESET} $branch"
+
+            local upstream
+            upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+            if [ -n "$upstream" ]; then
+                local ahead behind
+                ahead=$(git rev-list --count '@{u}'..HEAD 2>/dev/null || echo "0")
+                behind=$(git rev-list --count HEAD..'@{u}' 2>/dev/null || echo "0")
+
+                if [ "$ahead" -gt 0 ] || [ "$behind" -gt 0 ]; then
+                    local tracking_info=""
+                    [ "$ahead" -gt 0 ] && tracking_info="${GREEN}↑$ahead${RESET}"
+                    [ "$behind" -gt 0 ] && tracking_info="${tracking_info}${tracking_info:+ }${RED}↓$behind${RESET}"
+                    echo -e "   ${BLUE}remote:${RESET} $upstream ($tracking_info)"
+
+                    if [ "$verbose" -eq 1 ] && [ "$ahead" -gt 0 ]; then
+                        echo -e "   ${GRAY}ahead commits:${RESET}"
+                        git log --oneline '@{u}'..HEAD 2>/dev/null | while read -r commit_line; do
+                            echo -e "     ${GREEN}+${RESET} $commit_line"
+                        done
+                    fi
+
+                    if [ "$verbose" -eq 1 ] && [ "$behind" -gt 0 ]; then
+                        echo -e "   ${GRAY}behind commits:${RESET}"
+                        git log --oneline HEAD..'@{u}' 2>/dev/null | while read -r commit_line; do
+                            echo -e "     ${RED}-${RESET} $commit_line"
+                        done
+                    fi
+                else
+                    echo -e "   ${BLUE}remote:${RESET} $upstream ${GREEN}✓${RESET}"
+                fi
+            fi
+
+            local staged unstaged untracked
+            staged=$(git diff --cached --numstat 2>/dev/null | wc -l)
+            unstaged=$(git diff --numstat 2>/dev/null | wc -l)
+            untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
+
+            if [ "$staged" -eq 0 ] && [ "$unstaged" -eq 0 ] && [ "$untracked" -eq 0 ]; then
+                echo -e "   ${BLUE}status:${RESET} ${GREEN}clean${RESET}"
+            else
+                local status_parts=()
+                [ "$staged" -gt 0 ] && status_parts+=("${GREEN}$staged staged${RESET}")
+                [ "$unstaged" -gt 0 ] && status_parts+=("${YELLOW}$unstaged modified${RESET}")
+                [ "$untracked" -gt 0 ] && status_parts+=("${RED}$untracked untracked${RESET}")
+
+                echo -e "   ${BLUE}status:${RESET} $(IFS=', '; echo -e "${status_parts[*]}")"
+
+                if [ "$verbose" -eq 1 ] && [ "$staged" -gt 0 ]; then
+                    echo -e "   ${GRAY}staged files:${RESET}"
+                    git diff --cached --name-status 2>/dev/null | while read -r status_char file; do
+                        echo -e "     ${GREEN}$status_char${RESET} $file"
+                    done
+                fi
+
+                if [ "$verbose" -eq 1 ] && [ "$unstaged" -gt 0 ]; then
+                    echo -e "   ${GRAY}modified files:${RESET}"
+                    git diff --name-status 2>/dev/null | while read -r status_char file; do
+                        echo -e "     ${YELLOW}$status_char${RESET} $file"
+                    done
+                fi
+
+                if [ "$verbose" -eq 1 ] && [ "$untracked" -gt 0 ]; then
+                    echo -e "   ${GRAY}untracked files:${RESET}"
+                    git ls-files --others --exclude-standard 2>/dev/null | while read -r file; do
+                        echo -e "     ${RED}?${RESET} $file"
+                    done
+                fi
+            fi
+        ) || true
+
+        echo
+    done < <(get_worktrees)
+
+    if [ "$worktree_count" -eq 0 ]; then
+        echo "No worktrees found"
     fi
 }
 
@@ -325,6 +443,10 @@ run_in_worktrees() {
 }
 
 case "${1:-help}" in
+    status|st)
+        shift
+        status_worktrees "$@"
+        ;;
     list|ls)
         list_worktrees
         ;;
