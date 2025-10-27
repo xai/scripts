@@ -158,6 +158,8 @@ status_worktrees() {
                 else
                     echo -e "   ${BLUE}remote:${RESET} $upstream ${GREEN}✓${RESET}"
                 fi
+            else
+                echo -e "   ${BLUE}remote:${RESET} ${YELLOW}local only${RESET}"
             fi
 
             local staged unstaged untracked
