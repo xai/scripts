@@ -46,7 +46,7 @@ Just a collection of various scripts.
 - [wasserpegel.sh](wasserpegel.sh) - Check the Passau river level and email warnings when thresholds are exceeded.
 - [watch-inbox.sh](watch-inbox.sh) - Watch INBOX directories via inotify and display or notify on new mail.
 - [wrap.py](wrap.py) - Dedent and wrap text paragraphs to a configurable width.
-- [wt](wt) - Manage git worktrees: status, list, lock/unlock, cleanup, and run commands.
+- [wt](wt) - Manage git worktrees: status, list, checkout from remote, lock/unlock, cleanup, and run commands.
 
 ## Random snippets I looked up sometime and will probably need again
 

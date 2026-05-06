@@ -11,6 +11,9 @@ Commands:
               -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
     locked    List only locked worktrees
+    checkout  Create worktree from a remote branch:
+              wt checkout <branch> <parent-dir>
+              Uses the remote tracked by the current branch.
     cleanup   Remove all locked worktrees
     lock      Lock worktree(s): wt lock <path> [path2 ...]
               --clean        Lock all clean worktrees with remote (except primary)
@@ -23,6 +26,7 @@ Examples:
     wt status -v
     wt list
     wt locked
+    wt checkout foobar ../
     wt cleanup
     wt lock --clean
     wt lock /path/to/worktree
@@ -489,6 +493,77 @@ run_in_worktrees() {
     fi
 }
 
+checkout_worktree() {
+    require_repo
+
+    if [ $# -lt 2 ]; then
+        echo "Error: Usage: wt checkout <branch> <parent-dir>" >&2
+        exit 1
+    fi
+
+    local branch="$1"
+    local parent_dir="$2"
+
+    if [ ! -d "$parent_dir" ]; then
+        echo "Error: Parent directory does not exist: $parent_dir" >&2
+        exit 1
+    fi
+
+    local target_path
+    if [[ "$parent_dir" == */ ]]; then
+        target_path="${parent_dir}${branch}"
+    else
+        target_path="${parent_dir}/${branch}"
+    fi
+
+    if [ -e "$target_path" ]; then
+        echo "Error: Target path already exists: $target_path" >&2
+        exit 1
+    fi
+
+    local remote
+    local current_upstream
+    current_upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+    if [ -n "$current_upstream" ]; then
+        remote="${current_upstream%%/*}"
+    else
+        local remote_count
+        remote_count=$(git remote | wc -l)
+        if [ "$remote_count" -eq 0 ]; then
+            echo "Error: No remotes configured" >&2
+            exit 1
+        elif [ "$remote_count" -eq 1 ]; then
+            remote=$(git remote)
+        else
+            echo "Error: Current branch has no upstream and multiple remotes are configured." >&2
+            echo "Set an upstream for the current branch or run from a branch that tracks a remote." >&2
+            echo "Configured remotes:" >&2
+            git remote | sed 's/^/  /' >&2
+            exit 1
+        fi
+    fi
+
+    if ! git show-ref --verify --quiet "refs/remotes/$remote/$branch"; then
+        echo "Branch $remote/$branch not found locally; fetching..."
+        if ! git fetch "$remote" "$branch" 2>/dev/null; then
+            echo "Error: Branch '$branch' does not exist on remote '$remote'" >&2
+            exit 1
+        fi
+        if ! git show-ref --verify --quiet "refs/remotes/$remote/$branch"; then
+            echo "Error: Branch '$branch' does not exist on remote '$remote'" >&2
+            exit 1
+        fi
+    fi
+
+    echo "Creating worktree:"
+    echo "  branch: $branch"
+    echo "  path:   $target_path"
+    echo "  base:   $remote/$branch"
+    echo
+
+    git worktree add -b "$branch" "$target_path" "$remote/$branch"
+}
+
 case "${1:-help}" in
     status|st)
         shift
@@ -499,6 +574,10 @@ case "${1:-help}" in
         ;;
     locked)
         list_locked
+        ;;
+    checkout|co)
+        shift
+        checkout_worktree "$@"
         ;;
     cleanup|clean)
         cleanup_locked
