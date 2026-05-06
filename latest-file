@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Finds the most recently modified files recursively and prints their timestamp and path
+
+NUM=1
+DIR="."
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -n)
+            NUM="$2"
+            shift 2
+            ;;
+        *)
+            DIR="$1"
+            shift
+            ;;
+    esac
+done
+
+find "$DIR" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n "$NUM" | while read -r time file; do
+    printf "%s %s\n" "$(date -d "@$time" '+%Y-%m-%d %H:%M:%S')" "$file"
+done

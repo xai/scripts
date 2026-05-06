@@ -20,6 +20,7 @@ Just a collection of various scripts.
 - [git-push-all](git-push-all) - Push the current branch to every configured git remote.
 - [gpg-reencrypt.sh](gpg-reencrypt.sh) - Re-encrypt GPG files from an old key to a set of new recipients.
 - [hamster-export-all](hamster-export-all) - Export the Hamster time-tracking database to a dated text file.
+- [latest-file](latest-file) - Find the most recently modified files recursively and print their timestamp and path (supports -n for count).
 - [log](log) - Tee stdin to ~/logs/<cwd>/<timestamp>.log, creating directories as needed.
 - [lookup_email](lookup_email) - Fuzzy-search mutt's address index for matching contacts.
 - [mbox2mdir.py](mbox2mdir.py) - Convert an mbox archive into a maildir (optionally into a separate directory).
