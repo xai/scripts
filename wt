@@ -19,6 +19,10 @@ Commands:
               --clean        Lock all clean worktrees with remote (except primary)
     unlock    Unlock worktree(s): wt unlock <path> [path2 ...]
     run       Run command in worktrees: wt run [--locked|--all] -- <command>
+    open      Open a tmux window with a 2x2 pane grid for a worktree:
+              wt open <worktree>
+              <worktree> may be a path, branch name, or directory name.
+              The window is named after the worktree's branch.
     help      Show this help
 
 Examples:
@@ -36,6 +40,8 @@ Examples:
     wt run -- git clean -dfx
     wt run --locked -- git status
     wt run --all -- npm install
+    wt open ../my-feature-worktree
+    wt open my-feature-branch
 EOF
 }
 
@@ -76,9 +82,41 @@ get_worktrees() {
     }'
 }
 
+get_worktree_branches() {
+    git worktree list --porcelain | awk '
+    function emit() {
+        if (path != "") {
+            printf "%s\t%s\n", path, branch;
+        }
+    }
+    BEGIN {
+        path = "";
+        branch = "";
+    }
+    {
+        if ($1 == "worktree") {
+            emit();
+            path = substr($0, index($0, " ") + 1);
+            branch = "";
+        } else if ($1 == "branch") {
+            branch = substr($0, index($0, " ") + 1);
+            sub(/^refs\/heads\//, "", branch);
+        } else if ($1 == "detached") {
+            branch = "(detached)";
+        } else if ($0 == "") {
+            emit();
+            path = "";
+            branch = "";
+        }
+    }
+    END {
+        emit();
+    }'
+}
+
 list_worktrees() {
     require_repo
-    
+
     git worktree list
 }
 
@@ -564,6 +602,78 @@ checkout_worktree() {
     git worktree add -b "$branch" "$target_path" "$remote/$branch"
 }
 
+open_window() {
+    require_repo
+
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: Not inside a tmux session" >&2
+        exit 1
+    fi
+
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt open <worktree>" >&2
+        echo "  <worktree> may be a path, branch name, or worktree directory name" >&2
+        exit 1
+    fi
+
+    local target="$1"
+
+    # If the argument is a directory, resolve it to the worktree root it lives in.
+    local target_abs=""
+    if [ -d "$target" ]; then
+        target_abs=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || (cd "$target" && pwd))
+    fi
+
+    local wt_path="" branch=""
+    local matched_path=""
+    local name_matches=()
+
+    while IFS=$'\t' read -r p b; do
+        if [ -n "$target_abs" ] && [ "$p" = "$target_abs" ]; then
+            matched_path="$p"
+            branch="$b"
+            break
+        fi
+        if [ "$b" = "$target" ] || [ "$(basename "$p")" = "$target" ]; then
+            name_matches+=("$p"$'\t'"$b")
+        fi
+    done < <(get_worktree_branches)
+
+    if [ -n "$matched_path" ]; then
+        wt_path="$matched_path"
+    elif [ ${#name_matches[@]} -eq 1 ]; then
+        IFS=$'\t' read -r wt_path branch <<< "${name_matches[0]}"
+    elif [ ${#name_matches[@]} -gt 1 ]; then
+        echo "Error: '$target' matches multiple worktrees:" >&2
+        printf '  %s\n' "${name_matches[@]%%$'\t'*}" >&2
+        exit 1
+    else
+        echo "Error: No worktree found matching: $target" >&2
+        echo "Run 'wt list' to see available worktrees" >&2
+        exit 1
+    fi
+
+    local win_name="$branch"
+    if [ -z "$win_name" ] || [ "$win_name" = "(detached)" ]; then
+        win_name=$(basename "$wt_path")
+    fi
+
+    # Open a new window rooted at the worktree, then carve it into a 2x2 grid
+    # of panes (mirrors the '#' binding in ~/.tmux.conf), all sharing the cwd.
+    local window_id
+    window_id=$(tmux new-window -P -F '#{window_id}' -c "$wt_path" -n "$win_name")
+    tmux split-window -h -c "$wt_path"
+    tmux select-pane -L
+    tmux split-window -v -c "$wt_path"
+    tmux select-pane -R
+    tmux split-window -v -c "$wt_path"
+    tmux select-pane -t '{top-left}'
+
+    # Shells may rename the window from their prompt hook as the panes start up,
+    # so set the name explicitly once everything is in place to make it stick.
+    tmux rename-window -t "$window_id" "$win_name"
+}
+
 case "${1:-help}" in
     status|st)
         shift
@@ -593,6 +703,10 @@ case "${1:-help}" in
     run|exec)
         shift
         run_in_worktrees "$@"
+        ;;
+    open|o)
+        shift
+        open_window "$@"
         ;;
     help|--help|-h)
         usage
