@@ -43,10 +43,12 @@ Just a collection of various scripts.
 - [unixdate2iso](unixdate2iso) - Replace Unix timestamps in stdin with YYYYMMDD-HHMM strings.
 - [vbox-openport.sh](vbox-openport.sh) - Add a NAT port-forwarding rule to a VirtualBox VM.
 - [video-to-gif.sh](video-to-gif.sh) - Convert a video file into a GIF using ffmpeg palette filters.
+- [voice-clip](voice-clip) - Push-to-talk dictation for Sway: record while held, transcribe via wyoming-whisper, and copy the text to the clipboard (start/stop/toggle).
 - [wasserpegel.sh](wasserpegel.sh) - Check the Passau river level and email warnings when thresholds are exceeded.
 - [watch-inbox.sh](watch-inbox.sh) - Watch INBOX directories via inotify and display or notify on new mail.
 - [wrap.py](wrap.py) - Dedent and wrap text paragraphs to a configurable width.
 - [wt](wt) - Manage git worktrees: status, list, checkout from remote, lock/unlock, cleanup, run commands, and open a 2x2 tmux pane grid for a worktree.
+- [wyoming-transcribe](wyoming-transcribe) - Zero-dependency Wyoming-protocol ASR client: stream raw s16le PCM to a wyoming-whisper server and print the transcript (used by voice-clip).
 
 ## Random snippets I looked up sometime and will probably need again
 

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Push-to-talk voice -> clipboard, via a wyoming-whisper container.
+#
+# Records the default PipeWire/Pulse source while held, sends the audio to
+# wyoming-whisper over the Wyoming protocol (see ./wyoming-transcribe), and
+# puts the transcript on the Wayland clipboard with wl-copy.
+#
+# Sway keybindings (push-to-talk on $mod+v):
+#   bindsym           $mod+v exec voice-clip start
+#   bindsym --release $mod+v exec voice-clip stop
+#
+# Config via env: WHISPER_HOST (default localhost), WHISPER_PORT (default 10300),
+# WHISPER_LANGUAGE (default: auto-detect).
+set -euo pipefail
+
+WHISPER_HOST="${WHISPER_HOST:-localhost}"
+WHISPER_PORT="${WHISPER_PORT:-10300}"
+CLIENT="$(dirname "$(realpath "$0")")/wyoming-transcribe"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voice-clip"
+mkdir -p "$RUN_DIR"
+PIDFILE="$RUN_DIR/parec.pid"
+AUDIO="$RUN_DIR/rec.raw"
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 || return 0
+    # x-canonical-private-synchronous makes mako/dunst replace the prior toast,
+    # so "Recording..." is swapped for the result instead of stacking.
+    notify-send -a voice-clip -t "${2:-2500}" \
+        -h string:x-canonical-private-synchronous:voice-clip "$1" || true
+}
+
+recording() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+
+start() {
+    recording && exit 0          # ignore key-repeat / double start
+    parec --raw --format=s16le --rate=16000 --channels=1 >"$AUDIO" &
+    echo $! >"$PIDFILE"
+    notify "🎙  Recording…" 60000
+}
+
+stop() {
+    recording || { rm -f "$PIDFILE"; exit 0; }
+    pid="$(cat "$PIDFILE")"
+    rm -f "$PIDFILE"
+    kill "$pid" 2>/dev/null || true
+    # wait for parec to flush and exit (it's not our child; poll instead of wait)
+    for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+
+    if [[ ! -s "$AUDIO" ]]; then
+        notify "✗  Nothing recorded"
+        exit 0
+    fi
+
+    if ! text="$("$CLIENT" --host "$WHISPER_HOST" --port "$WHISPER_PORT" "$AUDIO")"; then
+        notify "✗  Whisper error — is it up on ${WHISPER_HOST}:${WHISPER_PORT}?" 5000
+        rm -f "$AUDIO"
+        exit 1
+    fi
+    rm -f "$AUDIO"
+
+    if [[ -z "${text//[[:space:]]/}" ]]; then
+        notify "✗  No speech recognized"
+        exit 0
+    fi
+
+    printf '%s' "$text" | wl-copy
+    notify "✓  ${text}" 4000
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop)  stop ;;
+    toggle) if recording; then stop; else start; fi ;;
+    *) echo "usage: voice-clip {start|stop|toggle}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Minimal Wyoming ASR client: raw PCM (s16le) in -> transcript text out.
+
+Speaks the Wyoming protocol directly over a plain TCP socket, so it needs no
+third-party packages -- just the stdlib. Used by the `voice-clip` wrapper to
+talk to a rhasspy/wyoming-whisper container (default tcp://localhost:10300).
+
+Input audio must be raw, signed 16-bit little-endian PCM. Mono 16 kHz is what
+whisper expects; record it with e.g.:
+
+    parec --raw --format=s16le --rate=16000 --channels=1 | wyoming-transcribe -
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+
+
+def write_event(sock, type_, data=None, payload=None):
+    """Write one Wyoming event: a JSON header line, then data, then payload."""
+    header = {"type": type_}
+    data_bytes = None
+    if data:
+        data_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        header["data_length"] = len(data_bytes)
+    if payload:
+        header["payload_length"] = len(payload)
+    sock.sendall((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
+    if data_bytes:
+        sock.sendall(data_bytes)
+    if payload:
+        sock.sendall(payload)
+
+
+def read_event(rfile):
+    """Read one Wyoming event from a buffered socket file. Returns (type, data)."""
+    line = rfile.readline()
+    if not line:
+        return None
+    header = json.loads(line)
+    data = {}
+    data_length = header.get("data_length")
+    if data_length is not None:
+        data = json.loads(rfile.read(data_length))
+    payload_length = header.get("payload_length")
+    if payload_length is not None:
+        rfile.read(payload_length)  # drained but unused for ASR
+    return header["type"], data
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("audio", nargs="?", default="-",
+                    help="raw s16le PCM file, or - for stdin (default)")
+    ap.add_argument("--host", default=os.environ.get("WHISPER_HOST", "localhost"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("WHISPER_PORT", "10300")))
+    ap.add_argument("--rate", type=int, default=16000)
+    ap.add_argument("--width", type=int, default=2)
+    ap.add_argument("--channels", type=int, default=1)
+    ap.add_argument("--language", default=os.environ.get("WHISPER_LANGUAGE") or None,
+                    help="force a language (default: let whisper auto-detect)")
+    ap.add_argument("--timeout", type=float, default=60.0)
+    args = ap.parse_args()
+
+    raw = sys.stdin.buffer.read() if args.audio == "-" else open(args.audio, "rb").read()
+    if not raw:
+        print("no audio on input", file=sys.stderr)
+        return 1
+
+    fmt = {"rate": args.rate, "width": args.width, "channels": args.channels}
+    bytes_per_sec = args.rate * args.width * args.channels
+
+    try:
+        sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
+    except OSError as e:
+        print(f"cannot reach whisper at {args.host}:{args.port}: {e}", file=sys.stderr)
+        return 1
+
+    with sock:
+        sock.settimeout(args.timeout)
+        rfile = sock.makefile("rb")
+
+        write_event(sock, "transcribe", {"language": args.language} if args.language else None)
+        write_event(sock, "audio-start", {**fmt, "timestamp": 0})
+
+        chunk = 2048  # bytes per audio-chunk
+        ts = 0
+        for i in range(0, len(raw), chunk):
+            block = raw[i:i + chunk]
+            write_event(sock, "audio-chunk", {**fmt, "timestamp": ts}, block)
+            ts += int(len(block) / bytes_per_sec * 1000)
+        write_event(sock, "audio-stop", {"timestamp": ts})
+
+        text = None
+        while True:
+            ev = read_event(rfile)
+            if ev is None:
+                break
+            type_, data = ev
+            if type_ == "transcript":
+                text = data.get("text", "")
+                break
+
+    if text is None:
+        print("no transcript returned by server", file=sys.stderr)
+        return 1
+
+    print(text.strip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
