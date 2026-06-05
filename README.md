@@ -52,6 +52,27 @@ Just a collection of various scripts.
 
 ## Random snippets I looked up sometime and will probably need again
 
+### Sway voice dictation (voice-clip)
+
+Push-to-talk speech-to-text into the clipboard, backed by a
+rhasspy/wyoming-whisper container.
+
+Add to `~/.config/sway/config`, then `swaymsg reload`:
+
+```
+bindsym           $mod+v exec /path/to/scripts/voice-clip start
+bindsym --release $mod+v exec /path/to/scripts/voice-clip stop
+```
+
+Hold **Mod+V**, speak, release — the transcript lands on the clipboard
+(paste with the usual Ctrl/Shift+V). `voice-clip toggle` is also available
+if you prefer a single press-to-start / press-to-stop binding.
+
+Needs `parec` (PipeWire/Pulse), `wl-copy`, and `python3`; `notify-send`
+plus a notification daemon (mako/dunst) is optional for the toasts.
+Override the server with env vars: `WHISPER_HOST` (default `localhost`),
+`WHISPER_PORT` (default `10300`), `WHISPER_LANGUAGE` (default: auto-detect).
+
 ### firewalld
 
 #### List zones / manage interfaces
