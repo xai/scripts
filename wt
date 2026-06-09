@@ -23,6 +23,9 @@ Commands:
               wt open <worktree>
               <worktree> may be a path, branch name, or directory name.
               The window is named after the worktree's branch.
+    close     Close the tmux window(s) of a worktree and lock it:
+              wt close <worktree>
+              <worktree> may be a path, branch name, or directory name.
     help      Show this help
 
 Examples:
@@ -42,6 +45,7 @@ Examples:
     wt run --all -- npm install
     wt open ../my-feature-worktree
     wt open my-feature-branch
+    wt close my-feature-branch
 EOF
 }
 
@@ -602,6 +606,50 @@ checkout_worktree() {
     git worktree add -b "$branch" "$target_path" "$remote/$branch"
 }
 
+# Resolve a worktree target (path, branch name, or directory name) into the
+# globals RESOLVED_PATH and RESOLVED_BRANCH. Exits with an error if the target
+# matches no worktree or is ambiguous.
+resolve_worktree() {
+    local target="$1"
+
+    # If the argument is a directory, resolve it to the worktree root it lives in.
+    local target_abs=""
+    if [ -d "$target" ]; then
+        target_abs=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || (cd "$target" && pwd))
+    fi
+
+    RESOLVED_PATH=""
+    RESOLVED_BRANCH=""
+    local matched_path="" matched_branch=""
+    local name_matches=()
+
+    while IFS=$'\t' read -r p b; do
+        if [ -n "$target_abs" ] && [ "$p" = "$target_abs" ]; then
+            matched_path="$p"
+            matched_branch="$b"
+            break
+        fi
+        if [ "$b" = "$target" ] || [ "$(basename "$p")" = "$target" ]; then
+            name_matches+=("$p"$'\t'"$b")
+        fi
+    done < <(get_worktree_branches)
+
+    if [ -n "$matched_path" ]; then
+        RESOLVED_PATH="$matched_path"
+        RESOLVED_BRANCH="$matched_branch"
+    elif [ ${#name_matches[@]} -eq 1 ]; then
+        IFS=$'\t' read -r RESOLVED_PATH RESOLVED_BRANCH <<< "${name_matches[0]}"
+    elif [ ${#name_matches[@]} -gt 1 ]; then
+        echo "Error: '$target' matches multiple worktrees:" >&2
+        printf '  %s\n' "${name_matches[@]%%$'\t'*}" >&2
+        exit 1
+    else
+        echo "Error: No worktree found matching: $target" >&2
+        echo "Run 'wt list' to see available worktrees" >&2
+        exit 1
+    fi
+}
+
 open_window() {
     require_repo
 
@@ -616,42 +664,8 @@ open_window() {
         exit 1
     fi
 
-    local target="$1"
-
-    # If the argument is a directory, resolve it to the worktree root it lives in.
-    local target_abs=""
-    if [ -d "$target" ]; then
-        target_abs=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || (cd "$target" && pwd))
-    fi
-
-    local wt_path="" branch=""
-    local matched_path=""
-    local name_matches=()
-
-    while IFS=$'\t' read -r p b; do
-        if [ -n "$target_abs" ] && [ "$p" = "$target_abs" ]; then
-            matched_path="$p"
-            branch="$b"
-            break
-        fi
-        if [ "$b" = "$target" ] || [ "$(basename "$p")" = "$target" ]; then
-            name_matches+=("$p"$'\t'"$b")
-        fi
-    done < <(get_worktree_branches)
-
-    if [ -n "$matched_path" ]; then
-        wt_path="$matched_path"
-    elif [ ${#name_matches[@]} -eq 1 ]; then
-        IFS=$'\t' read -r wt_path branch <<< "${name_matches[0]}"
-    elif [ ${#name_matches[@]} -gt 1 ]; then
-        echo "Error: '$target' matches multiple worktrees:" >&2
-        printf '  %s\n' "${name_matches[@]%%$'\t'*}" >&2
-        exit 1
-    else
-        echo "Error: No worktree found matching: $target" >&2
-        echo "Run 'wt list' to see available worktrees" >&2
-        exit 1
-    fi
+    resolve_worktree "$1"
+    local wt_path="$RESOLVED_PATH" branch="$RESOLVED_BRANCH"
 
     local win_name="$branch"
     if [ -z "$win_name" ] || [ "$win_name" = "(detached)" ]; then
@@ -672,6 +686,90 @@ open_window() {
     # Shells may rename the window from their prompt hook as the panes start up,
     # so set the name explicitly once everything is in place to make it stick.
     tmux rename-window -t "$window_id" "$win_name"
+}
+
+close_window() {
+    require_repo
+
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt close <worktree>" >&2
+        echo "  <worktree> may be a path, branch name, or worktree directory name" >&2
+        exit 1
+    fi
+
+    resolve_worktree "$1"
+    local wt_path="$RESOLVED_PATH" branch="$RESOLVED_BRANCH"
+
+    local primary_worktree
+    primary_worktree=$(git worktree list --porcelain | awk '/^worktree / {print substr($0, 10); exit}')
+    if [ "$wt_path" = "$primary_worktree" ]; then
+        echo "Error: Refusing to close the primary worktree: $wt_path" >&2
+        exit 1
+    fi
+
+    local label="$branch"
+    if [ -z "$label" ] || [ "$label" = "(detached)" ]; then
+        label=$(basename "$wt_path")
+    fi
+
+    # Close any tmux windows whose panes live in this worktree. Match by pane
+    # path rather than window name, since shells rename windows from their
+    # prompt hooks after 'wt open' sets the name. The window we're running in
+    # (if any) is deferred until after the lock below, so closing our own
+    # window can't abort the rest of the operation.
+    local kill_current=0 current_wid=""
+    if [ -n "${TMUX:-}" ]; then
+        current_wid=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
+
+        declare -A seen_windows
+        local window_ids=() line wid ppath
+        while IFS= read -r line; do
+            wid="${line%% *}"
+            ppath="${line#* }"
+            if [ "$ppath" = "$wt_path" ] || [[ "$ppath" == "$wt_path"/* ]]; then
+                if [ -z "${seen_windows[$wid]:-}" ]; then
+                    seen_windows["$wid"]=1
+                    window_ids+=("$wid")
+                fi
+            fi
+        done < <(tmux list-panes -a -F '#{window_id} #{pane_current_path}' 2>/dev/null)
+
+        if [ ${#window_ids[@]} -eq 0 ]; then
+            echo "No open tmux windows found for: $label"
+        else
+            for wid in "${window_ids[@]}"; do
+                if [ -n "$current_wid" ] && [ "$wid" = "$current_wid" ]; then
+                    kill_current=1
+                    continue
+                fi
+                tmux kill-window -t "$wid" 2>/dev/null || true
+            done
+            echo "Closed ${#window_ids[@]} tmux window(s) for: $label"
+        fi
+    else
+        echo "Not inside a tmux session; skipping pane cleanup"
+    fi
+
+    # Lock the worktree so it is parked (and eligible for 'wt cleanup').
+    local locked_flag=""
+    while IFS=$'\t' read -r p status; do
+        if [ "$p" = "$wt_path" ]; then
+            locked_flag="$status"
+            break
+        fi
+    done < <(get_worktrees)
+
+    if [ "$locked_flag" = "1" ]; then
+        echo "Already locked: $wt_path"
+    else
+        git worktree lock "$wt_path"
+        echo "Locked: $wt_path"
+    fi
+
+    # Finally close the window we're running in, if it belonged to this worktree.
+    if [ "$kill_current" -eq 1 ]; then
+        tmux kill-window -t "$current_wid" 2>/dev/null || true
+    fi
 }
 
 case "${1:-help}" in
@@ -707,6 +805,10 @@ case "${1:-help}" in
     open|o)
         shift
         open_window "$@"
+        ;;
+    close|c)
+        shift
+        close_window "$@"
         ;;
     help|--help|-h)
         usage
