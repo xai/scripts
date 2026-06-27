@@ -15,6 +15,11 @@ Commands:
               -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
     locked    List only locked worktrees
+    add       Create a worktree for a branch (sibling of the current worktree):
+              wt add <branch> [<start-point>]
+              Checks out an existing local branch, tracks a remote branch of
+              the same name, or creates a new branch off <start-point>
+              (default: HEAD). Worktree dir is <root>/<branch>.
     checkout  Create worktree from a remote branch:
               wt checkout <branch> <parent-dir>
               Uses the remote tracked by the current branch.
@@ -40,6 +45,8 @@ Examples:
     wt list
     wt locked
     wt checkout foobar ../
+    wt add my-feature
+    wt add hotfix origin/main
     wt cleanup
     wt lock --clean
     wt lock /path/to/worktree
@@ -672,6 +679,93 @@ checkout_worktree() {
     git worktree add -b "$branch" "$target_path" "$remote/$branch"
 }
 
+# Create a worktree for <branch> as a sibling of the current worktree. Unlike
+# checkout (remote branch, explicit parent dir) this is the general creator: it
+# reuses an existing local branch, tracks a remote branch of the same name, or
+# cuts a new branch off <start-point> (HEAD when omitted).
+add_worktree() {
+    require_repo
+
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt add <branch> [<start-point>]" >&2
+        exit 1
+    fi
+
+    local branch="$1"
+    local start_point="${2:-}"
+
+    local existing
+    if existing=$(worktree_path_for_branch "$branch"); then
+        echo "Error: A worktree for '$branch' already exists: $existing" >&2
+        exit 1
+    fi
+
+    local root
+    root=$(worktree_root) || { echo "Error: Could not determine worktree root" >&2; exit 1; }
+    local target_path="$root/$branch"
+
+    if [ -e "$target_path" ]; then
+        echo "Error: Target path already exists: $target_path" >&2
+        exit 1
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        echo "Creating worktree for existing branch '$branch' at $target_path"
+        git worktree add "$target_path" "$branch"
+    elif [ -n "$start_point" ]; then
+        echo "Creating worktree '$branch' (off $start_point) at $target_path"
+        git worktree add -b "$branch" "$target_path" "$start_point"
+    else
+        # No local branch and no explicit base: track a remote branch of the
+        # same name if one exists, otherwise branch off the current HEAD.
+        local remote_ref="" r
+        for r in $(git remote); do
+            if git show-ref --verify --quiet "refs/remotes/$r/$branch"; then
+                remote_ref="$r/$branch"
+                break
+            fi
+        done
+        if [ -n "$remote_ref" ]; then
+            echo "Creating worktree '$branch' tracking $remote_ref at $target_path"
+            git worktree add -b "$branch" "$target_path" "$remote_ref"
+        else
+            echo "Creating worktree '$branch' (new branch off HEAD) at $target_path"
+            git worktree add -b "$branch" "$target_path"
+        fi
+    fi
+}
+
+# Echo the directory that holds the worktrees. In the bare-repo layout every
+# worktree (main included) is a sibling under this root, so a new worktree for
+# branch <b> belongs at <root>/<b>.
+worktree_root() {
+    local top common
+    if top=$(git rev-parse --show-toplevel 2>/dev/null); then
+        dirname "$top"
+        return 0
+    fi
+    # The bare root has no work tree of its own; fall back to the common git dir.
+    if common=$(git rev-parse --git-common-dir 2>/dev/null); then
+        common=$(cd "$common" 2>/dev/null && pwd) || return 1
+        dirname "$common"
+        return 0
+    fi
+    return 1
+}
+
+# Echo the path of the worktree currently checked out on <branch>, or return 1
+# if none has it. Non-fatal counterpart to resolve_worktree.
+worktree_path_for_branch() {
+    local want="$1" p b
+    while IFS=$'\t' read -r p b; do
+        if [ "$b" = "$want" ]; then
+            echo "$p"
+            return 0
+        fi
+    done < <(get_worktree_branches)
+    return 1
+}
+
 # Resolve a worktree target (path, branch name, or directory name) into the
 # globals RESOLVED_PATH and RESOLVED_BRANCH. Exits with an error if the target
 # matches no worktree or is ambiguous.
@@ -852,6 +946,10 @@ case "${1:-help}" in
         ;;
     locked)
         list_locked
+        ;;
+    add|new)
+        shift
+        add_worktree "$@"
         ;;
     checkout|co)
         shift
