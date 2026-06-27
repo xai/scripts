@@ -11,6 +11,10 @@ Commands:
               wt clone <repo-url> [target-dir]
               Creates <target-dir>/{.bare,.git,<default-branch>}; target-dir
               defaults to the repo name. See docs/git/worktrees.md.
+    init      Create a new local repo in the bare-repo + worktrees layout:
+              wt init <projname>
+              Creates <projname>/{.bare,.git,main} and seeds main with an
+              empty initial commit. Fails if <projname> already exists.
     status    Show clean status overview of all worktrees
               -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
@@ -44,6 +48,7 @@ Commands:
 Examples:
     wt clone git@github.com:you/proj.git
     wt clone git@github.com:you/proj.git ~/Git/proj
+    wt init my-new-project
     wt status
     wt status -v
     wt list
@@ -613,6 +618,51 @@ clone_repo() {
     echo "Done: $target/$default_branch (worktree '$default_branch')"
 }
 
+# Create a brand-new LOCAL repo in the bare-repo + worktrees layout (no remote).
+# Sibling of clone: where clone copies an existing remote, init git-inits an
+# empty .bare and seeds 'main' with an initial empty commit, leaving a layout
+# that's immediately usable. Runs outside any repo (it creates one), so no
+# require_repo.
+init_repo() {
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt init <projname>" >&2
+        exit 1
+    fi
+
+    local target="$1"
+    local branch="main"
+
+    if [ -e "$target" ]; then
+        echo "Error: Target path already exists: $target" >&2
+        exit 1
+    fi
+
+    echo "Initializing new repo in bare-repo + worktrees layout:"
+    echo "  root:   $target"
+    echo "  branch: $branch"
+    echo
+
+    mkdir -p "$target"
+
+    # 1. The git database, never checked out.
+    git init --bare "$target/.bare"
+
+    # 2. The one-line pointer that lets git commands run from the root.
+    printf 'gitdir: ./.bare\n' > "$target/.git"
+
+    # 3. Name the default branch 'main' regardless of the user's
+    #    init.defaultBranch, so the layout matches the rest of the tooling.
+    git --git-dir="$target/.bare" symbolic-ref HEAD "refs/heads/$branch"
+
+    # 4. Materialize 'main' as an orphan worktree (the repo has no commits yet)
+    #    and seed it with an empty initial commit so it's ready to use.
+    git -C "$target" worktree add --orphan -b "$branch" "$branch"
+    git -C "$target/$branch" commit --allow-empty -m "Initial commit"
+
+    echo
+    echo "Done: $target/$branch (worktree '$branch')"
+}
+
 checkout_worktree() {
     require_repo
 
@@ -1038,6 +1088,10 @@ case "${1:-help}" in
     clone)
         shift
         clone_repo "$@"
+        ;;
+    init)
+        shift
+        init_repo "$@"
         ;;
     status|st)
         shift
