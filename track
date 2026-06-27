@@ -1,0 +1,144 @@
+#!/bin/bash
+# Usage: track <project> <package>
+
+usage() {
+	echo "Usage: track <project> <package>"
+	exit 1
+}
+
+current() {
+	hamster current
+}
+
+stoptrack() {
+	hamster stop
+}
+
+list() {
+	hamster list
+}
+
+export_activities() {
+	hamster export tsv | egrep '[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}' | tr -d '\r' | tr '\t' ';'
+}
+
+track() {
+	project="$1"
+	package="$2"
+	if [ -n "$4" ]; then
+		start_time="$3"
+		stop_time="$4"
+		if [ -n "$package" ]; then
+			package="#$package"
+		fi
+		echo hamster add "$project" "$package" "$start_time - $stop_time"
+		hamster add "$project", "$package" "$start_time - $stop_time"
+	elif [ -n "$3" ]; then
+		start_time="$3"
+		echo hamster add "$project" "$package" "$start_time"
+		hamster add "$project", "$package" "$start_time"
+	else
+		echo hamster start "$project" "$package"
+		hamster start "$project", "$package"
+	fi
+}
+
+PROJECTSDIR="$HOME/.projects"
+
+if [ ! -d "$PROJECTSDIR" ]; then
+	echo "No projects directory found at $PROJECTSDIR"
+	exit 1
+fi
+
+if [ -z "$1" ]; then
+	usage
+fi
+
+if [ "$1" = "stop" ]; then
+	echo "Stopping: $(current)"
+	stoptrack
+	exit 0
+elif [ "$1" = "list" ]; then
+	list
+	exit 0
+elif [ "$1" = "current" ]; then
+	current
+	exit 0
+elif [ "$1" = "resume" ]; then
+	current="$(current)"
+	if [ "$current" != "No activity" ]; then
+		echo "No activity to resume"
+		exit 1
+	fi
+	lastactivity="$(export_activities | tail -n1)"
+	echo "Resuming: $lastactivity"
+	project="$(echo "$lastactivity" | cut -d';' -f1)"
+	package="$(echo "$lastactivity" | cut -d';' -f7)"
+	starttime="$(echo "$lastactivity" | cut -d';' -f3)"
+	
+	if [ -n "$package" ] && [ "${package:0:1}" != "#" ]; then
+		package="#$package"
+	fi
+
+	track "$project" "$package" "$starttime"
+elif [ "$1" = "fill-gaps" ]; then
+	start_time=""
+	stop_time=""
+	prev=""
+	export_activities | cat -n
+	echo
+	let i=1
+	export_activities | while read -r line; do
+		if [ -n "$stop_time" ]; then
+			start_time="$(echo "$line" | cut -d';' -f2)"
+			if [ "$start_time" != "$stop_time" ]; then
+				echo "< $prev"
+				echo "> $line"
+				echo -e "\nGap from $stop_time to $start_time ($i) "
+				read response < /dev/tty
+				if [ $response = "1" -o $response = "l" ];
+				then
+					echo "Filling with previous ..."
+					project="$(echo "$prev" | cut -d';' -f1)"
+					package="$(echo "$prev" | cut -d';' -f7)"
+					track "$project" "$package" "$stop_time" "$start_time"
+				elif [ $response = "2" -o $response = "r" ];
+				then
+					echo "Filling with next"
+					project="$(echo "$line" | cut -d';' -f1)"
+					package="$(echo "$line" | cut -d';' -f7)"
+					track "$project" "$package" "$stop_time" "$start_time"
+				else
+					echo "Skipping"
+				fi
+				echo
+			fi
+		fi
+		stop_time="$(echo "$line" | cut -d';' -f3)"
+		prev="$line"
+		let i++
+	done
+
+elif [ "$1" = "export" ]; then
+	export_activities
+	exit 0
+else
+	project="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+	package="$2"
+
+	if [ -n "$package" ] && [ -f $PROJECTSDIR/$project ]; then
+		package="#$(grep -i "$package" "$PROJECTSDIR/$project")"
+		if [ "$package" == "#" ]; then
+			package=""
+		fi
+	fi
+
+	if [ -n "$3" ]; then
+		starttime="$3"
+		track "$project" "$package" "$starttime"
+	else
+		track "$project" "$package"
+	fi
+
+fi
+
