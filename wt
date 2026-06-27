@@ -32,6 +32,10 @@ Commands:
               wt open <worktree>
               <worktree> may be a path, branch name, or directory name.
               The window is named after the worktree's branch.
+    open-pr   Open a tmux window for a GitHub PR, creating its worktree first:
+              wt open-pr <number>
+              Resolves the PR's head branch via gh, checks it out as a worktree
+              if needed (forks use a pr-<number> branch), then opens like 'open'.
     close     Close the tmux window(s) of a worktree and lock it:
               wt close <worktree>
               <worktree> may be a path, branch name, or directory name.
@@ -58,6 +62,7 @@ Examples:
     wt run --all -- npm install
     wt open ../my-feature-worktree
     wt open my-feature-branch
+    wt open-pr 1234
     wt close my-feature-branch
 EOF
 }
@@ -848,6 +853,103 @@ open_window() {
     tmux rename-window -t "$window_id" "$win_name"
 }
 
+# Open a tmux window for a GitHub PR. Resolves the PR's head branch with gh,
+# materializes a worktree for it if one doesn't exist yet, then hands off to
+# open_window so the PR opens exactly like 'wt open'.
+open_pr() {
+    require_repo
+
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: Not inside a tmux session" >&2
+        exit 1
+    fi
+
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt open-pr <number>" >&2
+        exit 1
+    fi
+
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "Error: 'gh' (GitHub CLI) is required for open-pr but was not found" >&2
+        exit 1
+    fi
+
+    local pr="$1"
+
+    # One gh call for the head branch and whether it comes from a fork.
+    local pr_info head_branch cross_repo
+    if ! pr_info=$(gh pr view "$pr" --json headRefName,isCrossRepository \
+            -q '.headRefName + "\t" + (.isCrossRepository | tostring)' 2>&1); then
+        echo "Error: Could not read PR #$pr via gh:" >&2
+        printf '%s\n' "$pr_info" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    head_branch="${pr_info%%$'\t'*}"
+    cross_repo="${pr_info##*$'\t'}"
+
+    if [ -z "$head_branch" ]; then
+        echo "Error: Could not determine head branch for PR #$pr" >&2
+        exit 1
+    fi
+
+    # Same-repo PRs reuse the author's branch name so the worktree tracks origin
+    # and shows up in `wt status`. Fork PRs get a pr-<number> branch: their head
+    # isn't on origin under that name, and the name (e.g. 'main') may collide.
+    local branch
+    if [ "$cross_repo" = "true" ]; then
+        branch="pr-$pr"
+    else
+        branch="$head_branch"
+    fi
+
+    # Already checked out somewhere? Just open it.
+    local existing
+    if existing=$(worktree_path_for_branch "$branch"); then
+        echo "Worktree for PR #$pr already exists: $existing"
+        open_window "$branch"
+        return
+    fi
+
+    local root
+    root=$(worktree_root) || { echo "Error: Could not determine worktree root" >&2; exit 1; }
+    local target_path="$root/$branch"
+    if [ -e "$target_path" ]; then
+        echo "Error: Target path already exists: $target_path" >&2
+        exit 1
+    fi
+
+    echo "Setting up worktree for PR #$pr (head '$head_branch'):"
+    echo "  path: $target_path"
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        echo "  from: existing local branch '$branch'"
+        echo
+        git worktree add "$target_path" "$branch"
+    elif [ "$cross_repo" = "true" ]; then
+        # Fork PR: the head isn't a branch on origin, but GitHub still exposes it
+        # at refs/pull/<n>/head. Fetch that and pin a local branch to it.
+        echo "  from: origin pull/$pr/head (fork)"
+        echo
+        git fetch origin "pull/$pr/head"
+        git worktree add -b "$branch" "$target_path" FETCH_HEAD
+    else
+        # Same-repo PR: the head is a branch on origin. Fetch it, then track
+        # origin/<branch> when the remote-tracking ref exists (so `wt status`
+        # and pulls work). Repos cloned without a +refs/heads/*:refs/remotes/*
+        # refspec won't have that ref, so fall back to the fetched commit.
+        echo "  from: origin/$head_branch"
+        echo
+        git fetch origin "$head_branch"
+        if git show-ref --verify --quiet "refs/remotes/origin/$head_branch"; then
+            git worktree add -b "$branch" "$target_path" "origin/$head_branch"
+        else
+            git worktree add -b "$branch" "$target_path" FETCH_HEAD
+        fi
+    fi
+
+    open_window "$branch"
+}
+
 close_window() {
     require_repo
 
@@ -973,6 +1075,10 @@ case "${1:-help}" in
     open|o)
         shift
         open_window "$@"
+        ;;
+    open-pr|pr)
+        shift
+        open_pr "$@"
         ;;
     close|c)
         shift
