@@ -35,7 +35,8 @@ Commands:
     open      Open a tmux window with a 2x2 pane grid for a worktree:
               wt open <worktree>
               <worktree> may be a path, branch name, or directory name.
-              The window is named after the worktree's branch.
+              If no worktree exists yet but <worktree> names a branch, it is
+              created first (like 'wt add'). Window is named after the branch.
     open-pr   Open a tmux window for a GitHub PR, creating its worktree first:
               wt open-pr <number>
               Resolves the PR's head branch via gh, checks it out as a worktree
@@ -731,7 +732,15 @@ checkout_worktree() {
     echo "  base:   $remote/$branch"
     echo
 
-    git worktree add -b "$branch" "$target_path" "$remote/$branch"
+    # In the bare-repo layout `git clone --bare` imports every origin branch as
+    # a local head, so <branch> usually already exists. Reuse it when so;
+    # otherwise create it from the remote. Either way, make it track the remote.
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        git worktree add "$target_path" "$branch"
+    else
+        git worktree add -b "$branch" "$target_path" "$remote/$branch"
+    fi
+    ensure_upstream "$branch" "$remote/$branch"
 }
 
 # Create a worktree for <branch> as a sibling of the current worktree. Unlike
@@ -767,6 +776,15 @@ add_worktree() {
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         echo "Creating worktree for existing branch '$branch' at $target_path"
         git worktree add "$target_path" "$branch"
+        # A bare clone leaves local heads without an upstream; if a remote
+        # branch of the same name exists, track it so status and pulls work.
+        local r
+        for r in $(git remote); do
+            if git show-ref --verify --quiet "refs/remotes/$r/$branch"; then
+                ensure_upstream "$branch" "$r/$branch"
+                break
+            fi
+        done
     elif [ -n "$start_point" ]; then
         echo "Creating worktree '$branch' (off $start_point) at $target_path"
         git worktree add -b "$branch" "$target_path" "$start_point"
@@ -821,10 +839,36 @@ worktree_path_for_branch() {
     return 1
 }
 
+# Point <branch> at <remote-ref> (e.g. origin/foo) as its upstream, but only
+# when it isn't already tracking something and the remote ref exists. A
+# `git clone --bare` leaves local heads without upstreams, so worktrees built
+# from them would otherwise show as "local only".
+ensure_upstream() {
+    local branch="$1" remote_ref="$2"
+    git show-ref --verify --quiet "refs/remotes/$remote_ref" || return 0
+    if git rev-parse --abbrev-ref --symbolic-full-name "$branch@{u}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if git branch --set-upstream-to="$remote_ref" "$branch" >/dev/null 2>&1; then
+        echo "Tracking $remote_ref"
+    fi
+}
+
+# True if <name> is an existing branch — a local head or a branch on any remote.
+branch_exists() {
+    local name="$1" r
+    git show-ref --verify --quiet "refs/heads/$name" && return 0
+    for r in $(git remote); do
+        git show-ref --verify --quiet "refs/remotes/$r/$name" && return 0
+    done
+    return 1
+}
+
 # Resolve a worktree target (path, branch name, or directory name) into the
-# globals RESOLVED_PATH and RESOLVED_BRANCH. Exits with an error if the target
-# matches no worktree or is ambiguous.
-resolve_worktree() {
+# globals RESOLVED_PATH and RESOLVED_BRANCH. Non-fatal: returns 0 on a unique
+# match, 2 on an ambiguous one (candidates printed), 1 when nothing matches —
+# so callers can decide whether a miss is an error or a cue to create.
+try_resolve_worktree() {
     local target="$1"
 
     # If the argument is a directory, resolve it to the worktree root it lives in.
@@ -852,15 +896,29 @@ resolve_worktree() {
     if [ -n "$matched_path" ]; then
         RESOLVED_PATH="$matched_path"
         RESOLVED_BRANCH="$matched_branch"
+        return 0
     elif [ ${#name_matches[@]} -eq 1 ]; then
         IFS=$'\t' read -r RESOLVED_PATH RESOLVED_BRANCH <<< "${name_matches[0]}"
+        return 0
     elif [ ${#name_matches[@]} -gt 1 ]; then
         echo "Error: '$target' matches multiple worktrees:" >&2
         printf '  %s\n' "${name_matches[@]%%$'\t'*}" >&2
-        exit 1
-    else
-        echo "Error: No worktree found matching: $target" >&2
+        return 2
+    fi
+
+    return 1
+}
+
+# Fatal wrapper: resolve into RESOLVED_PATH/RESOLVED_BRANCH or exit. Used where
+# a miss should stop the command (e.g. close).
+resolve_worktree() {
+    local rc=0
+    try_resolve_worktree "$1" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+        echo "Error: No worktree found matching: $1" >&2
         echo "Run 'wt list' to see available worktrees" >&2
+        exit 1
+    elif [ "$rc" -ne 0 ]; then
         exit 1
     fi
 }
@@ -879,7 +937,30 @@ open_window() {
         exit 1
     fi
 
-    resolve_worktree "$1"
+    # Resolve to an existing worktree; if there's none but <worktree> names a
+    # real branch (local or on a remote), create the worktree on the fly like
+    # 'wt add', then open it. A path/typo that's no branch stays an error.
+    local rc=0
+    try_resolve_worktree "$1" || rc=$?
+    if [ "$rc" -eq 2 ]; then
+        exit 1
+    elif [ "$rc" -ne 0 ]; then
+        if branch_exists "$1"; then
+            echo "No worktree for '$1' yet; creating one..."
+            echo
+            add_worktree "$1"
+            echo
+            try_resolve_worktree "$1" || {
+                echo "Error: Could not open a worktree for: $1" >&2
+                exit 1
+            }
+        else
+            echo "Error: No worktree or branch found matching: $1" >&2
+            echo "Run 'wt list' to see worktrees, or 'wt add <branch>' to create one" >&2
+            exit 1
+        fi
+    fi
+
     local wt_path="$RESOLVED_PATH" branch="$RESOLVED_BRANCH"
 
     local win_name="$branch"
