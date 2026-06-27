@@ -7,6 +7,10 @@ usage() {
 Usage: wt <command> [options]
 
 Commands:
+    clone     Clone a remote into the bare-repo + worktrees layout:
+              wt clone <repo-url> [target-dir]
+              Creates <target-dir>/{.bare,.git,<default-branch>}; target-dir
+              defaults to the repo name. See docs/git/worktrees.md.
     status    Show clean status overview of all worktrees
               -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
@@ -29,6 +33,8 @@ Commands:
     help      Show this help
 
 Examples:
+    wt clone git@github.com:you/proj.git
+    wt clone git@github.com:you/proj.git ~/Git/proj
     wt status
     wt status -v
     wt list
@@ -535,6 +541,66 @@ run_in_worktrees() {
     fi
 }
 
+# Clone a remote into the bare-repo + worktrees layout from docs/git/worktrees.md
+# ("Cloning an existing remote"): the git database lives in an un-checked-out .bare,
+# a one-line .git pointer makes the root behave like a repo, and every branch — main
+# included — is an equal, removable worktree. Runs outside any repo (it creates one),
+# so no require_repo here.
+clone_repo() {
+    if [ $# -lt 1 ]; then
+        echo "Error: Usage: wt clone <repo-url> [target-dir]" >&2
+        exit 1
+    fi
+
+    local url="$1"
+    local target="${2:-}"
+
+    # Derive the project dir from the URL when not given: drop a trailing .git and
+    # slash, then take the final path segment (or the scp-style host:path segment).
+    if [ -z "$target" ]; then
+        target="${url%.git}"
+        target="${target%/}"
+        target="${target##*/}"
+        target="${target##*:}"
+    fi
+
+    if [ -z "$target" ]; then
+        echo "Error: Could not derive a target directory from '$url'; pass one explicitly" >&2
+        exit 1
+    fi
+
+    if [ -e "$target" ]; then
+        echo "Error: Target path already exists: $target" >&2
+        exit 1
+    fi
+
+    echo "Cloning into bare-repo + worktrees layout:"
+    echo "  repo: $url"
+    echo "  root: $target"
+    echo
+
+    mkdir -p "$target"
+
+    # 1. The git database, never checked out.
+    git clone --bare "$url" "$target/.bare"
+
+    # 2. The one-line pointer that lets git commands run from the root.
+    printf 'gitdir: ./.bare\n' > "$target/.git"
+
+    # 3. A bare clone fetches into refs/heads/*; without this refspec `git fetch`
+    #    never populates origin/* and worktrees won't track upstream as expected.
+    git --git-dir="$target/.bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+    # 4. Materialize the default branch (per the clone's HEAD) as the first
+    #    worktree; fall back to the conventional 'main' if HEAD can't be read.
+    local default_branch
+    default_branch=$(git --git-dir="$target/.bare" symbolic-ref --short HEAD 2>/dev/null || echo main)
+    git -C "$target" worktree add "$default_branch"
+
+    echo
+    echo "Done: $target/$default_branch (worktree '$default_branch')"
+}
+
 checkout_worktree() {
     require_repo
 
@@ -773,6 +839,10 @@ close_window() {
 }
 
 case "${1:-help}" in
+    clone)
+        shift
+        clone_repo "$@"
+        ;;
     status|st)
         shift
         status_worktrees "$@"
