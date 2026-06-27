@@ -55,3 +55,7 @@ docs/_build/
 
 # PyBuilder
 target/
+
+# Personal/local tmux bootstrap; holds client and project names, kept out of
+# this (potentially public) repo. Remove this line if you sanitize and commit it.
+startup.sh
