@@ -47,7 +47,7 @@ Just a collection of various scripts.
 - [wasserpegel.sh](wasserpegel.sh) - Check the Passau river level and email warnings when thresholds are exceeded.
 - [watch-inbox.sh](watch-inbox.sh) - Watch INBOX directories via inotify and display or notify on new mail.
 - [wrap.py](wrap.py) - Dedent and wrap text paragraphs to a configurable width.
-- [wt](wt) - Manage git worktrees: status, list, checkout from remote, lock/unlock, cleanup, run commands, open a 2x2 tmux pane grid for a worktree, and close a worktree's tmux windows while locking it.
+- [wt](wt) - Manage git worktrees: clone a remote into the bare-repo + worktrees layout, status, list, checkout from remote, lock/unlock, cleanup, run commands, open a 2x2 tmux pane grid for a worktree, and close a worktree's tmux windows while locking it.
 - [wyoming-transcribe](wyoming-transcribe) - Zero-dependency Wyoming-protocol ASR client: stream raw s16le PCM to a wyoming-whisper server and print the transcript (used by voice-clip).
 
 ## Random snippets I looked up sometime and will probably need again
