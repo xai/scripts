@@ -36,6 +36,7 @@ Just a collection of various scripts.
 - [start_console](start_console) - Bring up a tmux session using an alternate config with logging panes pre-seeded.
 - [start_tmux](start_tmux) - Initialize tmux sessions/windows for code, writing, and host-specific work.
 - [sync-to-reverse-ssh.sh](sync-to-reverse-ssh.sh) - Send recent ZFS snapshots through a reverse SSH tunnel.
+- [theia-ide-dev](theia-ide-dev) - Build and run the Theia IDE "Next" product against a local Theia framework checkout: full/incremental builds (build/rebuild), dependency sync (sync), package, unlink, plus the raw dev harness, with paired theia/theia-ide worktrees auto-created per branch (-v <branch>, default master); Node 24 via nvm.
 - [time-since.sh](time-since.sh) - Report elapsed time since a given date in days, weeks, months, or years.
 - [timew-import](timew-import) - Import a pipe-delimited log into timewarrior and annotate entries.
 - [toclip](toclip) - Execute commands from arguments or the clipboard and copy command plus output back to the clipboard.

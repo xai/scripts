@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# theia-ide-dev — build and run the Theia IDE "Next" product against a local Theia
+# framework checkout (or launch Theia's raw developer harness).
+#
+# The Theia repo's examples/electron is a developer harness with sample menus
+# and test contributions. The real end-user product is the IDE's electron-next
+# app ("Theia IDE Next"): proper branding, curated packages and AI features.
+# This script builds that product on top of a local Theia checkout, so your
+# framework changes show up wrapped in the actual IDE.
+#
+# Each branch maps to a paired set of worktrees, auto-created on first use so
+# several branches build side by side without clobbering each other's
+# node_modules links or build output:
+#
+#     theia/<branch>      Theia framework (the code you edit)
+#     theia-ide/<branch>  Theia IDE product, linked against theia/<branch>
+#
+# (theia-ide/<branch> is detached on the IDE's own master; only the Theia it
+# links against differs. master uses the existing primary worktrees.)
+#
+# Usage: theia-ide-dev [-v <branch>] [-n] [-o <build-opt>] [command] [-- <app args>]
+#
+# Commands (default: run):
+#   run       Launch the IDE Next product from theia-ide/<branch>. Uses the
+#             EXISTING build — it does NOT recompile. After editing Theia
+#             source use 'rebuild', not 'run', or your edits won't show (run
+#             warns when the source is newer than the build).
+#   build     Full build: yarn install + symlink @theia/* from theia/<branch>,
+#             compile Theia, build the IDE app and fetch plugins, then run.
+#             Minutes the first time. Needed when dependencies change or after
+#             a fresh checkout.
+#   rebuild   The edit/test loop: recompile theia/<branch> (npm run compile) +
+#             rebuild the IDE app (build:applications:next:dev), then run. Falls
+#             back to a full build if none exists yet.
+#   sync <pkg|@scope>...
+#             Copy the named third-party package(s) from theia/<branch> into the
+#             IDE worktree, plus any NEW transitive deps they pull in that the
+#             IDE lacks (existing IDE deps are left untouched). Use after bumping
+#             a non-@theia dependency: build/rebuild only link @theia/*, so the
+#             IDE keeps the OLD version otherwise. A bare @scope (e.g. @openai)
+#             copies every installed package in that scope. Does not run.
+#   package   Full build with --package; distributable lands in
+#             applications/electron-next/dist/ (does not run).
+#   unlink    Restore the IDE worktree's published npm @theia/* deps.
+#   harness   Run Theia's own examples/electron developer harness from
+#             theia/<branch> (sample contributions; the pre-product behavior).
+#
+# Options:
+#   -v <branch>    Branch / worktree pairing (default: master).
+#   -n             Build only; skip the run step (build / rebuild).
+#   -o <build-opt> Pass an option to build-with-local-theia.js (repeatable),
+#                  for build / package. E.g. -o --skip-plugins, -o --dry-run.
+#   -h             Show this help.
+#
+# Args after `--` (or trailing args) go to the launched application — e.g. a
+# folder to open as a workspace, or --inspect — for run, harness, and the
+# auto-run after build/rebuild. Relative paths (like `.`) are resolved against
+# the directory you ran the command from. (For `sync`, trailing args are the
+# package/scope names to copy, not app args.)
+#
+# Workflow (run from your branch's Theia checkout: ~/Git/eclipse-theia/theia/<branch>)
+#
+#   First build of a branch, or after ANY dependency change:
+#       theia-ide-dev -v <branch> build
+#
+#   Edited Theia SOURCE -> see it in the IDE (recompile + rebundle + run):
+#       theia-ide-dev -v <branch> rebuild -- .
+#
+#   Just relaunch the existing build (no recompile):
+#       theia-ide-dev -v <branch> run -- .
+#
+#   Changed a DEPENDENCY (a package.json / lockfile, e.g. bump @openai/codex-sdk):
+#   build and rebuild do NOT refresh third-party deps in the IDE worktree (the
+#   linker only handles @theia/*), so the IDE keeps the old version. Instead:
+#       (cd ~/Git/eclipse-theia/theia/<branch> && npm install)   # install in Theia
+#       theia-ide-dev -v <branch> sync @openai/codex-sdk         # copy the bumped dep (+ its new deps) into the IDE
+#       theia-ide-dev -v <branch> run -- .
+#
+#   `-- .` opens the current directory as the workspace; drop it to start the
+#   IDE without opening a folder.
+
+NODE_VERSION="24"
+THEIA_ROOT="$HOME/Git/eclipse-theia/theia"
+IDE_ROOT="$HOME/Git/eclipse-theia/theia-ide"
+BRANCH="master"
+NORUN=0
+BUILD_OPTS=()
+
+usage() {
+	# Print the contiguous header comment block (after the shebang), stripped.
+	awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+	exit "${1:-1}"
+}
+
+# --- Argument parsing ------------------------------------------------------
+while getopts ":v:no:h" opt; do
+	case "$opt" in
+		v) BRANCH="$OPTARG" ;;
+		n) NORUN=1 ;;
+		o) BUILD_OPTS+=("$OPTARG") ;;
+		h) usage 0 ;;
+		:) echo "Error: -$OPTARG requires an argument" >&2; usage ;;
+		\?) echo "Error: unknown option -$OPTARG" >&2; usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+CMD="run"
+if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+	case "$1" in
+		run|build|rebuild|sync|package|unlink|harness) CMD="$1"; shift ;;
+		*) echo "Error: unknown command '$1'" >&2; usage ;;
+	esac
+fi
+[ "${1:-}" = "--" ] && shift
+ARGS=("$@")             # raw positional args after the command (sync uses these)
+
+# Path-resolve args for the launched application, while we are still in the
+# invocation directory — run_ide/harness cd into a worktree before launching, so
+# a relative arg like `.` would otherwise resolve there. Non-path args (flags
+# such as --inspect) are passed through untouched.
+APP_ARGS=()
+for _a in "${ARGS[@]}"; do
+	if [ "${_a#-}" = "$_a" ] && [ -e "$_a" ]; then
+		APP_ARGS+=("$(realpath -- "$_a" 2>/dev/null || echo "$_a")")
+	else
+		APP_ARGS+=("$_a")
+	fi
+done
+
+# A --dry-run build produces nothing to launch, so don't try to run after it.
+for _o in "${BUILD_OPTS[@]}"; do
+	[ "$_o" = "--dry-run" ] && NORUN=1
+done
+
+THEIA_WT="$THEIA_ROOT/$BRANCH"
+IDE_WT="$IDE_ROOT/$BRANCH"
+
+# --- Node via nvm (needed for both build and run) --------------------------
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+	echo "Error: nvm not found at $NVM_DIR/nvm.sh" >&2
+	exit 1
+fi
+# shellcheck disable=SC1091
+. "$NVM_DIR/nvm.sh"
+if ! nvm use "$NODE_VERSION" >/dev/null; then
+	echo "Error: Node $NODE_VERSION not available (try: nvm install $NODE_VERSION)" >&2
+	exit 1
+fi
+
+set -eo pipefail
+
+# --- Helpers ---------------------------------------------------------------
+
+# Create the theia/<branch> and theia-ide/<branch> worktrees if missing.
+ensure_worktrees() {
+	if [ ! -d "$THEIA_WT" ]; then
+		echo ">> Creating Theia worktree '$BRANCH' at $THEIA_WT"
+		if ! git -C "$THEIA_ROOT/master" worktree add "$THEIA_WT" "$BRANCH" 2>/dev/null; then
+			echo ">> '$BRANCH' not local; fetching and tracking origin/$BRANCH"
+			git -C "$THEIA_ROOT/master" fetch origin "$BRANCH"
+			git -C "$THEIA_ROOT/master" worktree add "$THEIA_WT" -b "$BRANCH" "origin/$BRANCH"
+		fi
+	fi
+	if [ ! -d "$IDE_WT" ]; then
+		echo ">> Creating Theia IDE worktree '$BRANCH' at $IDE_WT (detached on master)"
+		git -C "$IDE_ROOT/master" worktree add --detach "$IDE_WT" master
+	fi
+}
+
+# True once a full build has linked the local @theia/* packages.
+is_linked() { [ -e "$IDE_WT/node_modules/@theia/core" ]; }
+
+# Warn (don't block) if Theia source changed since the IDE app was last built —
+# 'run' would otherwise silently launch stale code. Compares the newest file
+# under theia/<branch>/packages/*/src (the code you edit) against the newest
+# electron-next build artifact. The `|| true` keeps a missing worktree or
+# no-match glob from aborting under `set -e`.
+warn_if_stale() {
+	local src_t bld_t
+	src_t=$(find "$THEIA_WT"/packages/*/src -type f -printf '%T@\n' 2>/dev/null \
+		| sort -nr | head -1) || true
+	bld_t=$(find "$IDE_WT/applications/electron-next/lib" -type f -printf '%T@\n' 2>/dev/null \
+		| sort -nr | head -1) || true
+	[ -n "$src_t" ] && [ -n "$bld_t" ] || return 0
+	if awk "BEGIN { exit !($src_t > $bld_t) }"; then
+		echo "Warning: theia/$BRANCH has changed since the last IDE build." >&2
+		echo "         'run' launches the existing build, so your edits won't show." >&2
+		echo "         Rebuild + run instead: $(basename "$0") -v $BRANCH rebuild" >&2
+		echo >&2
+	fi
+}
+
+# Given target package/scope names, emit "dep<TAB>theiaVersion<TAB>ideVersion"
+# for each package to copy theia -> IDE: the named targets themselves (force,
+# even if present at another version), plus any of their transitive deps (as
+# hoisted in the Theia checkout) that are MISSING from the IDE. Packages the IDE
+# already has at a different version are deliberately left alone. A bare @scope
+# expands to every package installed under that scope in the checkout.
+compute_dep_sync() {
+	node - "$THEIA_WT" "$IDE_WT" "$@" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const [theiaWt, ideWt, ...targets] = process.argv.slice(2);
+const theiaNM = path.join(theiaWt, 'node_modules');
+const ideNM = path.join(ideWt, 'node_modules');
+const readJson = p => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+const ver = (nm, dep) => { const j = readJson(path.join(nm, dep, 'package.json')); return j && j.version; };
+
+// Expand bare scopes (@openai) into the packages installed under them.
+const roots = new Set();
+for (const t of targets) {
+  if (/^@[^/]+$/.test(t)) {
+    try { for (const sub of fs.readdirSync(path.join(theiaNM, t))) roots.add(t + '/' + sub); }
+    catch { process.stderr.write(`   (no such scope in theia: ${t})\n`); }
+  } else {
+    roots.add(t);
+  }
+}
+
+const toCopy = new Map(); // dep -> ideVersion ('-' if absent)
+for (const dep of roots) {
+  if (!ver(theiaNM, dep)) { process.stderr.write(`   (not installed in theia, skipped: ${dep})\n`); continue; }
+  toCopy.set(dep, ver(ideNM, dep) || '-');
+}
+
+// Walk the closure; add only deps the IDE is MISSING entirely.
+const seen = new Set(roots);
+const stack = [...roots];
+while (stack.length) {
+  const j = readJson(path.join(theiaNM, stack.pop(), 'package.json'));
+  if (!j) continue;
+  for (const d of Object.keys({ ...j.dependencies, ...j.optionalDependencies })) {
+    if (seen.has(d)) continue;
+    seen.add(d);
+    stack.push(d);
+    if (ver(theiaNM, d) && !ver(ideNM, d)) toCopy.set(d, '-');
+  }
+}
+
+for (const [dep, iv] of toCopy) process.stdout.write(dep + '\t' + ver(theiaNM, dep) + '\t' + iv + '\n');
+NODE
+}
+
+# Full build against theia/<branch>. Extra args go to build-with-local-theia.js.
+full_build() {
+	ensure_worktrees
+	echo ">> Full build: Theia IDE Next vs theia/$BRANCH"
+	( cd "$IDE_WT" && yarn build:local-theia --theia-path "$THEIA_WT" "$@" )
+}
+
+# Fast incremental rebuild: recompile Theia, rebuild the IDE app only.
+incremental_build() {
+	if ! is_linked; then
+		echo ">> No existing build for '$BRANCH'; doing a full build first."
+		full_build
+		return
+	fi
+	echo ">> Incremental rebuild vs theia/$BRANCH"
+	( cd "$THEIA_WT" && npm run compile )
+	( cd "$IDE_WT" && yarn build:applications:next:dev )
+}
+
+run_hint() {
+	echo
+	echo ">> Built. Run it with:"
+	echo "   $(basename "$0") -v $BRANCH"
+}
+
+# Run the IDE Next product. Args forwarded to the application.
+run_ide() {
+	if ! is_linked; then
+		echo "Error: theia-ide/$BRANCH is not built yet." >&2
+		echo "Build it first: $(basename "$0") -v $BRANCH build" >&2
+		exit 1
+	fi
+	echo ">> Starting Theia IDE Next (theia-ide/$BRANCH)"
+	cd "$IDE_WT"
+	exec yarn --cwd applications/electron-next start "$@"
+}
+
+# --- Dispatch --------------------------------------------------------------
+case "$CMD" in
+	run)
+		warn_if_stale
+		run_ide "${APP_ARGS[@]}"
+		;;
+	build)
+		full_build "${BUILD_OPTS[@]}"
+		[ "$NORUN" -eq 1 ] && { run_hint; exit 0; }
+		run_ide "${APP_ARGS[@]}"
+		;;
+	rebuild)
+		incremental_build
+		[ "$NORUN" -eq 1 ] && { run_hint; exit 0; }
+		run_ide "${APP_ARGS[@]}"
+		;;
+	sync)
+		if [ "${#ARGS[@]}" -eq 0 ]; then
+			echo "Error: sync needs a package or @scope to copy, e.g.:" >&2
+			echo "   $(basename "$0") -v $BRANCH sync @openai/codex-sdk" >&2
+			echo "   $(basename "$0") -v $BRANCH sync @openai        # the whole scope" >&2
+			exit 1
+		fi
+		is_linked || { echo "Error: theia-ide/$BRANCH isn't linked yet — run a full build first:" >&2
+			echo "   $(basename "$0") -v $BRANCH build" >&2; exit 1; }
+		[ -d "$THEIA_WT/node_modules" ] || { echo "Error: theia/$BRANCH has no node_modules — install deps first:" >&2
+			echo "   (cd $THEIA_WT && npm install)" >&2; exit 1; }
+		echo ">> Syncing ${ARGS[*]}: theia/$BRANCH -> theia-ide/$BRANCH"
+		mapfile -t _rows < <(compute_dep_sync "${ARGS[@]}")
+		if [ "${#_rows[@]}" -eq 0 ]; then
+			echo "   Nothing to copy (targets not found in theia/$BRANCH/node_modules)."
+			exit 0
+		fi
+		for _row in "${_rows[@]}"; do
+			_dep=${_row%%$'\t'*}
+			_rest=${_row#*$'\t'}
+			_newv=${_rest%%$'\t'*}
+			_oldv=${_rest##*$'\t'}
+			_src="$THEIA_WT/node_modules/$_dep"
+			_dst="$IDE_WT/node_modules/$_dep"
+			[ -e "$_src" ] || continue
+			mkdir -p "$(dirname "$_dst")"
+			rm -rf "$_dst"
+			cp -a "$_src" "$_dst"
+			printf '   %-34s %s -> %s\n' "$_dep" "$_oldv" "$_newv"
+		done
+		echo ">> Synced ${#_rows[@]} package(s). Relaunch: $(basename "$0") -v $BRANCH run -- ."
+		;;
+	package)
+		full_build --package "${BUILD_OPTS[@]}"
+		echo
+		echo ">> Distributable under: $IDE_WT/applications/electron-next/dist/"
+		;;
+	unlink)
+		[ -d "$IDE_WT" ] || { echo "Error: no IDE worktree at $IDE_WT" >&2; exit 1; }
+		echo ">> Restoring npm @theia/* deps in theia-ide/$BRANCH"
+		( cd "$IDE_WT" && yarn build:local-theia --unlink )
+		;;
+	harness)
+		[ -d "$THEIA_WT" ] || { echo "Error: no Theia worktree at $THEIA_WT" >&2; exit 1; }
+		echo ">> Starting Theia dev harness (examples/electron, theia/$BRANCH)"
+		cd "$THEIA_WT"
+		if [ ${#APP_ARGS[@]} -gt 0 ]; then
+			exec npm run start:electron -- "${APP_ARGS[@]}"
+		else
+			exec npm run start:electron
+		fi
+		;;
+esac
