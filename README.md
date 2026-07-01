@@ -44,7 +44,7 @@ Just a collection of various scripts.
 - [unixdate2iso](unixdate2iso) - Replace Unix timestamps in stdin with YYYYMMDD-HHMM strings.
 - [vbox-openport.sh](vbox-openport.sh) - Add a NAT port-forwarding rule to a VirtualBox VM.
 - [video-to-gif.sh](video-to-gif.sh) - Convert a video file into a GIF using ffmpeg palette filters.
-- [voice-clip](voice-clip) - Push-to-talk dictation for Sway: record while held, transcribe via wyoming-whisper, and copy the text to the clipboard (start/stop/toggle).
+- [voice-clip](voice-clip) - Push-to-talk dictation for Sway: record while held, transcribe via wyoming-whisper, and copy the text to the clipboard. Records a preferred mic (optional `~/.config/voice-clip/sources`) and sends a togglable language hint (start/stop/toggle/sources/lang).
 - [wasserpegel.sh](wasserpegel.sh) - Check the Passau river level and email warnings when thresholds are exceeded.
 - [watch-inbox.sh](watch-inbox.sh) - Watch INBOX directories via inotify and display or notify on new mail.
 - [wrap.py](wrap.py) - Dedent and wrap text paragraphs to a configurable width.
@@ -61,18 +61,33 @@ rhasspy/wyoming-whisper container.
 Add to `~/.config/sway/config`, then `swaymsg reload`:
 
 ```
-bindsym           $mod+v exec /path/to/scripts/voice-clip start
-bindsym --release $mod+v exec /path/to/scripts/voice-clip stop
+bindsym           $mod+v       exec /path/to/scripts/voice-clip start
+bindsym --release $mod+v       exec /path/to/scripts/voice-clip stop
+bindsym           $mod+Shift+v exec /path/to/scripts/voice-clip lang next
 ```
 
 Hold **Mod+V**, speak, release — the transcript lands on the clipboard
 (paste with the usual Ctrl/Shift+V). `voice-clip toggle` is also available
 if you prefer a single press-to-start / press-to-stop binding.
 
+**Microphone:** records the PipeWire default source unless an optional
+`~/.config/voice-clip/sources` lists preferred mics — one case-insensitive
+name/description substring per line, priority order; the first available
+source wins (else the default, so a bare laptop still works). `voice-clip
+sources` lists candidates and shows the pick; `$VOICE_CLIP_SOURCE` overrides.
+
+**Language:** the transcribe request carries a language hint (some backends,
+e.g. Parakeet, route per language — `en` to an English model, else a
+multilingual one). `voice-clip` keeps a current language; `$mod+Shift+v`
+(`voice-clip lang next`) cycles it, shown in the recording toast. The cycle
+list defaults to `en de`; extend via `$VOICE_CLIP_LANGUAGES` (`"en de fr"`)
+or `~/.config/voice-clip/languages` (one code per line).
+
 Needs `parec` (PipeWire/Pulse), `wl-copy`, and `python3`; `notify-send`
 plus a notification daemon (mako/dunst) is optional for the toasts.
 Override the server with env vars: `WHISPER_HOST` (default `localhost`),
-`WHISPER_PORT` (default `10300`), `WHISPER_LANGUAGE` (default: auto-detect).
+`WHISPER_PORT` (default `10300`), `WHISPER_LANGUAGE` (initial default
+language, before the first toggle).
 
 ### firewalld
 

@@ -1,26 +1,54 @@
 #!/usr/bin/env bash
 # Push-to-talk voice -> clipboard, via a wyoming-whisper container.
 #
-# Records the default PipeWire/Pulse source while held, sends the audio to
+# Records a PipeWire/Pulse capture source while held, sends the audio to
 # wyoming-whisper over the Wyoming protocol (see ./wyoming-transcribe), and
 # puts the transcript on the Wayland clipboard with wl-copy.
 #
-# Sway keybindings (push-to-talk on $mod+v):
-#   bindsym           $mod+v exec voice-clip start
-#   bindsym --release $mod+v exec voice-clip stop
+# Sway keybindings (push-to-talk on $mod+v; cycle language on $mod+Shift+v):
+#   bindsym           $mod+v       exec voice-clip start
+#   bindsym --release $mod+v       exec voice-clip stop
+#   bindsym           $mod+Shift+v exec voice-clip lang next
+#
+# Microphone selection:
+#   By default records the PipeWire default source. To prefer specific mics
+#   (e.g. the headset nearest you), list them one per line, highest priority
+#   first, in an optional file:
+#       ~/.config/voice-clip/sources   (override path with $VOICE_CLIP_SOURCES_FILE)
+#   Each line is a case-insensitive substring matched against a capture source's
+#   name AND description; the first line that matches a currently-available
+#   source wins. Blank lines and '#' comments are ignored. If the file is absent
+#   or nothing matches (e.g. laptop standalone), the PipeWire default is used.
+#   Run `voice-clip sources` to list available mics and see which one would win.
+#   $VOICE_CLIP_SOURCE (a single pattern) takes priority over the file for one run.
+#
+# Dictation language:
+#   The Parakeet backend routes per request by the Wyoming language hint:
+#   'en' -> the English model, any other code -> the multilingual model (which
+#   also decodes in that language). voice-clip keeps a current language and
+#   sends it as the hint. Cycle it with `voice-clip lang next` (bound to
+#   $mod+Shift+v); the current language shows in the recording toast. The cycle
+#   list defaults to "en de" -- override with $VOICE_CLIP_LANGUAGES ("en de fr")
+#   or ~/.config/voice-clip/languages (one code per line). `voice-clip lang
+#   <code>` sets it directly. State lives in $XDG_RUNTIME_DIR/voice-clip/lang
+#   and resets to the default on logout.
 #
 # Config via env: WHISPER_HOST (default localhost), WHISPER_PORT (default 10300),
-# WHISPER_LANGUAGE (default: auto-detect).
+# WHISPER_LANGUAGE (initial default language, before the first toggle).
 set -euo pipefail
 
 WHISPER_HOST="${WHISPER_HOST:-localhost}"
 WHISPER_PORT="${WHISPER_PORT:-10300}"
 CLIENT="$(dirname "$(realpath "$0")")/wyoming-transcribe"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/voice-clip"
+SOURCES_FILE="${VOICE_CLIP_SOURCES_FILE:-$CONFIG_DIR/sources}"
+LANGUAGES_FILE="${VOICE_CLIP_LANGUAGES_FILE:-$CONFIG_DIR/languages}"
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voice-clip"
 mkdir -p "$RUN_DIR"
 PIDFILE="$RUN_DIR/parec.pid"
 AUDIO="$RUN_DIR/rec.raw"
+LANG_STATE="$RUN_DIR/lang"
 
 notify() {
     command -v notify-send >/dev/null 2>&1 || return 0
@@ -30,13 +58,97 @@ notify() {
         -h string:x-canonical-private-synchronous:voice-clip "$1" || true
 }
 
+# ---- microphone selection --------------------------------------------------
+
+# Emit "<name>\t<description>" for each real capture source (monitors excluded).
+avail_sources() {
+    pactl list sources 2>/dev/null | awk '
+        /^[[:space:]]*Name:/        { name = $2 }
+        /^[[:space:]]*Description:/ { d = $0; sub(/^[[:space:]]*Description:[[:space:]]*/, "", d);
+                                      if (name !~ /\.monitor$/) print name "\t" d }'
+}
+
+# Emit the source name to record from, or nothing (=> PipeWire default source).
+# Tries $VOICE_CLIP_SOURCE then each line of the preference file, first match
+# wins; each pattern is a case-insensitive substring of "<name>\t<description>".
+pick_source() {
+    local rows patterns pat name
+    rows="$(avail_sources || true)"
+    [[ -n "$rows" ]] || return 0
+    patterns=""
+    [[ -n "${VOICE_CLIP_SOURCE:-}" ]] && patterns+="${VOICE_CLIP_SOURCE}"$'\n'
+    [[ -r "$SOURCES_FILE" ]] && patterns+="$(cat "$SOURCES_FILE")"$'\n'
+    while IFS= read -r pat; do
+        pat="${pat%%#*}"                        # strip trailing comment
+        pat="${pat#"${pat%%[![:space:]]*}"}"    # ltrim
+        pat="${pat%"${pat##*[![:space:]]}"}"    # rtrim
+        [[ -n "$pat" ]] || continue
+        name="$(grep -iF -- "$pat" <<<"$rows" | head -n1 | cut -f1 || true)"
+        [[ -n "$name" ]] && { printf '%s\n' "$name"; return 0; }
+    done <<<"$patterns"
+    return 0
+}
+
+# ---- dictation language ----------------------------------------------------
+
+# Ordered list of languages to cycle through (first entry = default).
+languages() {
+    if [[ -n "${VOICE_CLIP_LANGUAGES:-}" ]]; then
+        printf '%s\n' ${VOICE_CLIP_LANGUAGES//,/ }
+    elif [[ -r "$LANGUAGES_FILE" ]]; then
+        awk 'NF && $1 !~ /^#/ { print $1 }' "$LANGUAGES_FILE"
+    else
+        printf '%s\n' en de
+    fi
+}
+
+# Current dictation language: state file > $WHISPER_LANGUAGE > first of list > en.
+active_lang() {
+    local a=""
+    [[ -r "$LANG_STATE" ]] && a="$(head -n1 "$LANG_STATE" | tr -d '[:space:]')"
+    [[ -n "$a" ]] || a="${WHISPER_LANGUAGE:-}"
+    [[ -n "$a" ]] || a="$(languages | head -n1 || true)"
+    printf '%s\n' "${a:-en}"
+}
+
+set_lang() {
+    printf '%s\n' "$1" >"$LANG_STATE"
+    notify "🗣  Dictation language → $1"
+    printf '%s\n' "$1"          # echo for CLI/scripts (discarded when run from sway)
+}
+
+# Advance to the next language in the cycle list (wraps).
+cycle_lang() {
+    local cur next="" langs i
+    cur="$(active_lang)"
+    mapfile -t langs < <(languages)
+    [[ ${#langs[@]} -gt 0 ]] || langs=(en)
+    for i in "${!langs[@]}"; do
+        if [[ "${langs[$i]}" == "$cur" ]]; then
+            next="${langs[$(( (i + 1) % ${#langs[@]} ))]}"
+            break
+        fi
+    done
+    [[ -n "$next" ]] || next="${langs[0]}"     # current not in list -> first
+    set_lang "$next"
+}
+
+# ---- recording -------------------------------------------------------------
+
 recording() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
 
 start() {
     recording && exit 0          # ignore key-repeat / double start
-    parec --raw --format=s16le --rate=16000 --channels=1 >"$AUDIO" &
+    local device desc="" dev_args=() lang
+    lang="$(active_lang)"
+    device="$(pick_source)"
+    if [[ -n "$device" ]]; then
+        dev_args=(--device="$device")
+        desc="$(avail_sources | grep -F -- "$device" | head -n1 | cut -f2- || true)"
+    fi
+    parec "${dev_args[@]}" --raw --format=s16le --rate=16000 --channels=1 >"$AUDIO" &
     echo $! >"$PIDFILE"
-    notify "🎙  Recording…" 60000
+    notify "🎙  Recording… [${lang}]${desc:+ · $desc}" 60000
 }
 
 stop() {
@@ -52,7 +164,8 @@ stop() {
         exit 0
     fi
 
-    if ! text="$("$CLIENT" --host "$WHISPER_HOST" --port "$WHISPER_PORT" "$AUDIO")"; then
+    local lang; lang="$(active_lang)"
+    if ! text="$("$CLIENT" --host "$WHISPER_HOST" --port "$WHISPER_PORT" --language "$lang" "$AUDIO")"; then
         notify "✗  Whisper error — is it up on ${WHISPER_HOST}:${WHISPER_PORT}?" 5000
         rm -f "$AUDIO"
         exit 1
@@ -68,9 +181,42 @@ stop() {
     notify "✓  ${text}" 4000
 }
 
+# ---- info ------------------------------------------------------------------
+
+# List available capture sources + show which mic and language would be used.
+list_sources() {
+    local rows chosen
+    rows="$(avail_sources || true)"
+    if [[ -z "$rows" ]]; then
+        echo "No capture sources found (is PipeWire/PulseAudio running?)." >&2
+        return 1
+    fi
+    echo "Available capture sources:"
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r name desc; do
+        printf '  %s\n      %s\n' "$desc" "$name"
+    done
+    echo
+    if [[ -r "$SOURCES_FILE" ]]; then
+        echo "Preference file: $SOURCES_FILE (present)"
+    else
+        echo "Preference file: $SOURCES_FILE (absent — using PipeWire default)"
+    fi
+    chosen="$(pick_source)"
+    echo "Would record from:  ${chosen:-<PipeWire default source>}"
+    echo "Dictation language: $(active_lang)  (cycle: $(languages | paste -sd' '))"
+}
+
 case "${1:-}" in
-    start) start ;;
-    stop)  stop ;;
-    toggle) if recording; then stop; else start; fi ;;
-    *) echo "usage: voice-clip {start|stop|toggle}" >&2; exit 2 ;;
+    start)   start ;;
+    stop)    stop ;;
+    toggle)  if recording; then stop; else start; fi ;;
+    sources) list_sources ;;
+    lang)
+        case "${2:-}" in
+            ""|show)    active_lang ;;
+            next|cycle) cycle_lang ;;
+            *)          set_lang "$2" ;;
+        esac
+        ;;
+    *) echo "usage: voice-clip {start|stop|toggle|sources|lang [next|<code>]}" >&2; exit 2 ;;
 esac
