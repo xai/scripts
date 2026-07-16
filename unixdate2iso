@@ -2,15 +2,24 @@
 
 set -e
 
-# Replace all unix timestamps that appear somewhere in a line from STDIN to human readable date
+# Replace all unix timestamps that appear somewhere in a line with a human readable date.
+# Lines are taken from the arguments if any are given, otherwise from STDIN.
 
-while IFS= read -r line; do
-	timestamp=$(echo "$line" | grep -o '[0-9]\{10\}' || true)
-	if [ -n "$timestamp" ]; then
+convert_line() {
+	line=$1
+	for timestamp in $(echo "$line" | grep -o '[0-9]\{10\}' || true); do
 		iso=$(date -d "@$timestamp" "+%Y%m%d-%H%M")
-		echo "$line" | sed "s_${timestamp}_${iso}_"
-	else
-		echo "$line"
-	fi
-done
+		line=$(echo "$line" | sed "s_${timestamp}_${iso}_")
+	done
+	echo "$line"
+}
 
+if [ $# -gt 0 ]; then
+	for arg in "$@"; do
+		convert_line "$arg"
+	done
+else
+	while IFS= read -r line; do
+		convert_line "$line"
+	done
+fi
