@@ -16,6 +16,7 @@ Just a collection of various scripts.
 - [fix-offlineimap-fuckup.sh](fix-offlineimap-fuckup.sh) - Strip OfflineIMAP headers from every message in a maildir.
 - [fix-zoom-ics.sh](fix-zoom-ics.sh) - Inject METHOD and VTIMEZONE blocks into Zoom calendar invites.
 - [get-latest-common-snap.sh](get-latest-common-snap.sh) - Show latest ZFS snapshots on two datasets plus the send command to sync them.
+- [gh-draft](gh-draft) - Create or update GitHub issues/PRs from markdown drafts with YAML frontmatter (labels, assignees, milestone, blocked-by deps; PR base/draft/reviewers; any repo via `repo:`/`-R`). Creating records the number back into the draft so re-runs update instead of duplicating; updates are add-only with a word-diff preview and confirmation, and refuse to touch other people's issues.
 - [gh-issue-get](gh-issue-get) - Fetch a GitHub issue body and copy it to the clipboard.
 - [git-push-all](git-push-all) - Push the current branch to every configured git remote.
 - [gpg-reencrypt.sh](gpg-reencrypt.sh) - Re-encrypt GPG files from an old key to a set of new recipients.
@@ -49,7 +50,7 @@ Just a collection of various scripts.
 - [wasserpegel.sh](wasserpegel.sh) - Check the Passau river level and email warnings when thresholds are exceeded.
 - [watch-inbox.sh](watch-inbox.sh) - Watch INBOX directories via inotify and display or notify on new mail.
 - [wrap.py](wrap.py) - Dedent and wrap text paragraphs to a configurable width.
-- [wt](wt) - Manage git worktrees: clone a remote into the bare-repo + worktrees layout, status, list, checkout from remote, lock/unlock, cleanup, run commands, open a 2x2 tmux pane grid for a worktree, and close a worktree's tmux windows while locking it.
+- [wt](wt) - Manage git worktrees: clone a remote into the bare-repo + worktrees layout, status, list, checkout from remote, lock/unlock, cleanup, run commands, open a tmux pane layout for a worktree (2x2 grid by default, configurable via `~/.config/wt/config.json`), and close a worktree's tmux windows while locking it.
 - [wyoming-transcribe](wyoming-transcribe) - Zero-dependency Wyoming-protocol ASR client: stream raw s16le PCM to a wyoming-whisper server and print the transcript (used by voice-clip).
 
 ## Random snippets I looked up sometime and will probably need again

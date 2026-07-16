@@ -32,11 +32,12 @@ Commands:
               --clean        Lock all clean worktrees with remote (except primary)
     unlock    Unlock worktree(s): wt unlock <path> [path2 ...]
     run       Run command in worktrees: wt run [--locked|--all] -- <command>
-    open      Open a tmux window with a 2x2 pane grid for a worktree:
+    open      Open a tmux window with a pane layout for a worktree:
               wt open <worktree>
               <worktree> may be a path, branch name, or directory name.
               If no worktree exists yet but <worktree> names a branch, it is
               created first (like 'wt add'). Window is named after the branch.
+              Layout: 2x2 grid by default; see Config below to change it.
     open-pr   Open a tmux window for a GitHub PR, creating its worktree first:
               wt open-pr <number>
               Resolves the PR's head branch via gh, checks it out as a worktree
@@ -70,6 +71,33 @@ Examples:
     wt open my-feature-branch
     wt open-pr 1234
     wt close my-feature-branch
+
+Config:
+    'wt open' / 'wt open-pr' read an optional \$XDG_CONFIG_HOME/wt/config.json
+    (default ~/.config/wt/config.json) to override the pane layout. Example —
+    one full-height pane on the left half, two stacked on the right half:
+
+        {
+          "open": {
+            "panes": 3,
+            "layout": "main-vertical",
+            "options": { "main-pane-width": "50%" },
+            "focus": 1
+          }
+        }
+
+    panes    number of panes to create (default: 4)
+    layout   tmux layout to apply (default: tiled): even-horizontal,
+             even-vertical, main-horizontal, main-vertical, tiled — or a
+             custom layout string as shown by
+             'tmux display-message -p "#{window_layout}"'. Arrange a window by
+             hand once, copy that string here, and the pane count is derived
+             from it ("panes" is then ignored).
+    options  window options to set before the layout is applied. The main-*
+             layouts size their big pane from main-pane-width /
+             main-pane-height (tmux defaults: 80 cols / 24 rows), so
+             "50%" puts the split in the middle; absolute values work too.
+    focus    1-based pane to focus, in creation order (default: 1)
 EOF
 }
 
@@ -923,6 +951,80 @@ resolve_worktree() {
     fi
 }
 
+# Load the pane layout for 'wt open' / 'wt open-pr' into the globals
+# CFG_OPEN_PANES / CFG_OPEN_LAYOUT / CFG_OPEN_FOCUS. Defaults reproduce the
+# original hardcoded 2x2 grid; ~/.config/wt/config.json (or
+# $XDG_CONFIG_HOME/wt/config.json) overrides them — see usage(). Any problem
+# with the file degrades to the defaults with a warning rather than failing.
+load_open_config() {
+    CFG_OPEN_PANES=4
+    CFG_OPEN_LAYOUT="tiled"
+    CFG_OPEN_FOCUS=1
+    CFG_OPEN_OPTIONS=()
+
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/wt/config.json"
+    [ -f "$cfg" ] || return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Warning: $cfg exists but jq is not installed; using the default layout" >&2
+        return 0
+    fi
+
+    local fields
+    if ! fields=$(jq -r '.open // {} | [(.panes // 4), (.layout // "tiled"), (.focus // 1)] | map(tostring) | .[]' "$cfg" 2>/dev/null); then
+        echo "Warning: Could not parse $cfg; using the default layout" >&2
+        return 0
+    fi
+
+    local panes layout focus
+    { read -r panes; read -r layout; read -r focus; } <<< "$fields"
+
+    if [[ "$panes" =~ ^[1-9][0-9]*$ ]]; then
+        CFG_OPEN_PANES=$panes
+    else
+        echo "Warning: Ignoring invalid \"open.panes\" ($panes) in $cfg" >&2
+    fi
+
+    if [ -n "$layout" ]; then
+        CFG_OPEN_LAYOUT=$layout
+    else
+        echo "Warning: Ignoring empty \"open.layout\" in $cfg" >&2
+    fi
+
+    if [[ "$focus" =~ ^[1-9][0-9]*$ ]]; then
+        CFG_OPEN_FOCUS=$focus
+    else
+        echo "Warning: Ignoring invalid \"open.focus\" ($focus) in $cfg" >&2
+    fi
+
+    # Window options to set before the layout is applied, as "key<TAB>value"
+    # entries (e.g. main-pane-width=50% moves the main-vertical split to the
+    # middle instead of tmux's 80-column default).
+    local opts line
+    if opts=$(jq -r '.open.options // {} | to_entries[] | "\(.key)\t\(.value | tostring)"' "$cfg" 2>/dev/null); then
+        while IFS= read -r line; do
+            [ -n "$line" ] && CFG_OPEN_OPTIONS+=("$line")
+        done <<< "$opts"
+    else
+        echo "Warning: Ignoring invalid \"open.options\" in $cfg" >&2
+    fi
+
+    # A custom '#{window_layout}' string encodes its own pane count: leaf cells
+    # look like WxH,X,Y,ID (containers lack the trailing ID). Derive "panes"
+    # from it so the two can never disagree.
+    case "$CFG_OPEN_LAYOUT" in
+        even-horizontal|even-vertical|main-horizontal|main-vertical|tiled)
+            ;;
+        *)
+            local leaves
+            leaves=$(grep -oE '[0-9]+x[0-9]+,[0-9]+,[0-9]+,[0-9]+(,|\]|\}|$)' <<< "$CFG_OPEN_LAYOUT" | wc -l)
+            if [ "$leaves" -ge 1 ]; then
+                CFG_OPEN_PANES=$leaves
+            fi
+            ;;
+    esac
+}
+
 open_window() {
     require_repo
 
@@ -968,16 +1070,48 @@ open_window() {
         win_name=$(basename "$wt_path")
     fi
 
-    # Open a new window rooted at the worktree, then carve it into a 2x2 grid
-    # of panes (mirrors the '#' binding in ~/.tmux.conf), all sharing the cwd.
-    local window_id
-    window_id=$(tmux new-window -P -F '#{window_id}' -c "$wt_path" -n "$win_name")
-    tmux split-window -h -c "$wt_path"
-    tmux select-pane -L
-    tmux split-window -v -c "$wt_path"
-    tmux select-pane -R
-    tmux split-window -v -c "$wt_path"
-    tmux select-pane -t '{top-left}'
+    # Open a new window rooted at the worktree and carve it into panes, all
+    # sharing the cwd. The default 2x2 grid mirrors the '#' binding in
+    # ~/.tmux.conf; ~/.config/wt/config.json overrides pane count, layout and
+    # focused pane (see 'wt help').
+    load_open_config
+
+    local window_id pane_id
+    read -r window_id pane_id < <(tmux new-window -P -F '#{window_id} #{pane_id}' -c "$wt_path" -n "$win_name")
+
+    # Window-local options from the config (e.g. main-pane-width), set before
+    # the layout is applied since layouts read them at apply time.
+    local opt key value
+    for opt in "${CFG_OPEN_OPTIONS[@]}"; do
+        IFS=$'\t' read -r key value <<< "$opt"
+        if ! tmux set-option -w -t "$window_id" -- "$key" "$value" 2>/dev/null; then
+            echo "Warning: tmux rejected window option '$key $value'" >&2
+        fi
+    done
+
+    local pane_ids=("$pane_id") i
+    for ((i = 2; i <= CFG_OPEN_PANES; i++)); do
+        if pane_id=$(tmux split-window -t "$window_id" -P -F '#{pane_id}' -c "$wt_path" 2>/dev/null); then
+            pane_ids+=("$pane_id")
+            # Re-spread after every split so a small window doesn't run out of
+            # room for later panes before the final layout is applied.
+            tmux select-layout -t "$window_id" tiled >/dev/null
+        else
+            echo "Warning: Created only $((i - 1)) of $CFG_OPEN_PANES panes; window too small?" >&2
+            break
+        fi
+    done
+
+    if ! tmux select-layout -t "$window_id" "$CFG_OPEN_LAYOUT" >/dev/null 2>&1; then
+        echo "Warning: tmux rejected layout '$CFG_OPEN_LAYOUT'; falling back to tiled" >&2
+        tmux select-layout -t "$window_id" tiled >/dev/null
+    fi
+
+    local focus="$CFG_OPEN_FOCUS"
+    if (( focus > ${#pane_ids[@]} )); then
+        focus=1
+    fi
+    tmux select-pane -t "${pane_ids[focus - 1]}"
 
     # Shells may rename the window from their prompt hook as the panes start up,
     # so set the name explicitly once everything is in place to make it stick.
