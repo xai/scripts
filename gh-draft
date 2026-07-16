@@ -1,0 +1,892 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gh-draft — create or update a GitHub issue or pull request from a local
+# markdown draft, using gh — or download one into a draft ('gh-draft get').
+#
+# One generalized tool in place of the per-repo create-issue.sh / create-pr.sh
+# / update-issue.sh / download-issue.sh scripts: any repo, issues and PRs,
+# create, update, and download. Run 'gh-draft -h' for the full reference.
+#
+# A draft is a markdown file with YAML frontmatter; everything below the
+# closing '---' is published verbatim as the body (the frontmatter is never
+# uploaded). Create vs update is decided by the recorded number: without an
+# 'issue:'/'pr:' number the draft is created and the number written back (so
+# a re-run updates instead of duplicating); with one, that issue/PR is
+# updated.
+#
+# Updates are non-destructive to GitHub-side metadata: they set title/body,
+# ADD labels/assignees/blocked_by dependencies, never remove anything (except
+# --prune-deps, which full-syncs blocked_by), never touch state, milestone,
+# or projects, refuse to edit issues/PRs authored by someone else, and
+# preview every change (body as a word-diff) before asking for confirmation.
+
+usage_short() {
+    echo "Usage: gh-draft [options] <draft.md> | gh-draft get [options] <number> [dest]   (run gh-draft -h for details)" >&2
+}
+
+usage() {
+    cat << 'EOF'
+Usage: gh-draft [options] <draft.md>
+   or: gh-draft get [options] <number> [dest]
+
+Create or update a GitHub issue or pull request from a markdown draft with
+YAML frontmatter. Without a recorded 'issue:'/'pr:' number the draft is
+created and the number written back into the draft; with one, the issue/PR
+is updated (add-only, with a preview and a confirmation prompt).
+
+Options:
+  -R, --repo OWNER/REPO   target repository (default: the draft's 'repo:'
+                          field, else the repo of the current directory)
+  -t, --type issue|pr     what to file (default: the draft's 'type:' field,
+                          else detected from pr:/base:/reviewers: fields or a
+                          .prs/ path component; falls back to issue)
+  -d, --delete            delete the draft after a successful create/update
+  -k, --keep              keep the draft (default)
+  -y, --yes               skip confirmation prompts
+  -n, --dry-run           resolve and preview everything but write nothing:
+                          no push, no create/edit, no draft changes
+      --prune-deps        update: also REMOVE blocked_by dependencies that
+                          the draft omits (default: add-only)
+      --allow-done        also act on a draft marked 'filing: done'
+      --strip-section H   drop the '## H' section from the published body
+                          (repeatable; heading text without the '## ')
+  -h, --help              show this help and exit
+
+Download mode (gh-draft get): fetch an issue/PR from GitHub into a local
+draft that round-trips with the publish mode — the frontmatter records repo,
+labels, assignees, milestone, blocked_by, base (PRs), the number, and
+'filing: done'; the body is verbatim. Issue vs PR is auto-detected unless -t
+is given; -R selects the repo as above. dest may be a file path, a directory
+(existing, or a path ending in '/') for a generated '<title-slug>.md' inside
+it, or '-' for stdout; omitted, it defaults to '<title-slug>.md' in the
+current directory.
+  -c, --clip              copy the body markdown to the clipboard instead of
+                          writing a file (wl-copy, xclip, or xsel)
+  -b, --body-only         write only the body, without frontmatter
+  -f, --force             overwrite an existing file
+
+Frontmatter reference (only 'title' is required):
+  title: "..."            issue/PR title
+  type: issue | pr        see -t
+  repo: owner/repo        see -R
+  labels: ["a", "b"]      inline or indented '- item' list; add-only on update
+  assignees: [alice]      add-only on update
+  milestone: "v1.2"       create only
+  blocked_by: [14, 143]   GitHub issue dependencies (issues only); add-only
+                          on update unless --prune-deps ('blocked_by: []'
+                          plus --prune-deps clears them all)
+  base: main              PR base branch (default: the repo's default branch)
+  draft: true             open the PR as a draft PR
+  reviewers: [bob]        PR reviewers (create only)
+  strip_sections: [Refs]  like --strip-section, declared in the draft
+  issue: 123 | pr: 45     recorded automatically on create; presence selects
+                          update mode
+  filing: ready           optional gate: when present, only 'ready' drafts
+                          are published ('done' needs --allow-done, anything
+                          else is skipped); flipped to 'done' on success
+
+PR creation runs from the current checkout: it refuses main/master and a
+detached HEAD, pushes the current branch (setting upstream if needed), and
+uses the repo's default branch as base when 'base:' is absent. PR updates
+only edit title/body/labels/assignees; push new commits with plain git push.
+EOF
+}
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+confirm() {
+    local reply
+    [[ "$ASSUME_YES" == true ]] && return 0
+    printf '%s [y/N] ' "$1" >&2
+    { read -r reply </dev/tty; } 2>/dev/null || reply=""
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# --- frontmatter access -----------------------------------------------------
+
+fm_has() {
+    printf '%s\n' "$FRONTMATTER" | grep -q "^$1:"
+}
+
+# Scalar value: double-quoted, single-quoted, or raw (raw is taken verbatim so
+# titles containing '#' survive).
+fm_value() {
+    local key="$1" v
+    v=$(printf '%s\n' "$FRONTMATTER" | sed -n "s/^${key}:[[:space:]]*\"\(.*\)\"[[:space:]]*$/\1/p" | head -n 1)
+    if [[ -z "$v" ]]; then
+        v=$(printf '%s\n' "$FRONTMATTER" | sed -n "s/^${key}:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" | head -n 1)
+    fi
+    if [[ -z "$v" ]]; then
+        v=$(printf '%s\n' "$FRONTMATTER" | sed -n "s/^${key}:[[:space:]]*//p" | head -n 1)
+        v="${v%"${v##*[![:space:]]}"}"
+    fi
+    printf '%s\n' "$v"
+}
+
+# Single-token fields (numbers, flags, branch names): first word, with any
+# trailing ' # comment' dropped.
+fm_token() {
+    local v
+    v=$(fm_value "$1")
+    v=$(printf '%s\n' "$v" | sed 's/[[:space:]]\{1,\}#.*$//')
+    printf '%s\n' "$v" | awk '{ print $1; exit }'
+}
+
+# One list item per output line, from either an inline list ('key: [a, "b"]'),
+# an indented '- item' block list, or a bare scalar ('key: a').
+fm_list() {
+    local key="$1" raw item
+    raw=$(printf '%s\n' "$FRONTMATTER" | awk -v k="$key" '
+        !found && index($0, k ":") == 1 {
+            found = 1
+            line = $0
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            if (line ~ /^\[/) {
+                sub(/^\[/, "", line)
+                sub(/\][^]]*$/, "", line)
+                n = split(line, parts, ",")
+                for (i = 1; i <= n; i++) print parts[i]
+                exit
+            }
+            if (line != "" && line !~ /^#/) { print line; exit }
+            inlist = 1
+            next
+        }
+        inlist {
+            if ($0 ~ /^[[:space:]]+-/) { sub(/^[[:space:]]+-[[:space:]]*/, ""); print }
+            else exit
+        }
+    ')
+    while IFS= read -r item; do
+        item=$(clean_item "$item")
+        [[ -n "$item" ]] && printf '%s\n' "$item"
+    done <<< "$raw"
+    return 0
+}
+
+# Trim an item, strip surrounding quotes, and drop a trailing ' # comment'
+# from unquoted items.
+clean_item() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    case "$s" in
+        \"*\") s="${s:1:${#s}-2}" ;;
+        \'*\') s="${s:1:${#s}-2}" ;;
+        *)
+            s=$(printf '%s\n' "$s" | sed 's/[[:space:]]\{1,\}#.*$//')
+            s="${s%"${s##*[![:space:]]}"}"
+            ;;
+    esac
+    printf '%s\n' "$s"
+}
+
+# --- draft write-back -------------------------------------------------------
+
+# Set the first frontmatter 'KEY:' line to VALUE, preserving any trailing
+# ' # comment'; insert the field before the closing '---' if it is missing.
+# Only touches the frontmatter block, never the body.
+draft_set_field() {
+    local file="$1" key="$2" val="$3" tmp
+    tmp=$(mktemp)
+    awk -v key="$key" -v val="$val" '
+        BEGIN { n = 0; done = 0 }
+        /^---$/ {
+            n++
+            if (n == 2 && !done) { print key ": " val; done = 1 }
+            print
+            next
+        }
+        n == 1 && !done && index($0, key ":") == 1 {
+            cmt = ""
+            if (match($0, /[[:space:]]+#.*$/)) cmt = substr($0, RSTART)
+            print key ": " val cmt
+            done = 1
+            next
+        }
+        { print }
+    ' "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp"
+}
+
+# --- GitHub "blocked by" issue dependencies ---------------------------------
+# The API takes the blocker's numeric DATABASE id (issue.id), not its #number,
+# so adding a blocker means resolving its number to an id first.
+
+bb_resolve_id() {
+    local num="$1" id
+    id=$(gh api "repos/$REPO/issues/$num" --jq '.id' 2>/dev/null) || return 1
+    [[ -n "$id" && "$id" != "null" ]] || return 1
+    printf '%s' "$id"
+}
+
+# One "NUMBER<TAB>ID" line per current blocker. Read-only.
+bb_current_pairs() {
+    gh api "repos/$REPO/issues/$1/dependencies/blocked_by" \
+        --jq '.[] | "\(.number)\t\(.id)"' 2>/dev/null || true
+}
+
+bb_add() {
+    gh api --method POST "repos/$REPO/issues/$1/dependencies/blocked_by" \
+        -F "issue_id=$2" >/dev/null
+}
+
+bb_remove() {
+    gh api --method DELETE "repos/$REPO/issues/$1/dependencies/blocked_by/$2" >/dev/null
+}
+
+# --- download (gh-draft get) ------------------------------------------------
+
+b64dec() { printf '%s' "$1" | base64 -d; }
+
+# ["a", "b"] / [14, 143] inline lists in the drafts' style; empty -> [].
+inline_str_list() {
+    local out="[" first=true item
+    for item in "$@"; do
+        [[ -n "$item" ]] || continue
+        [[ "$first" == true ]] || out+=", "
+        out+="\"${item//\"/\\\"}\""
+        first=false
+    done
+    printf '%s]' "$out"
+}
+
+inline_num_list() {
+    local out="[" first=true item
+    for item in "$@"; do
+        [[ -n "$item" ]] || continue
+        [[ "$first" == true ]] || out+=", "
+        out+="$item"
+        first=false
+    done
+    printf '%s]' "$out"
+}
+
+pick_clip_cmd() {
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+        CLIP_CMD=(wl-copy)
+    elif command -v xclip >/dev/null 2>&1; then
+        CLIP_CMD=(xclip -selection clipboard)
+    elif command -v xsel >/dev/null 2>&1; then
+        CLIP_CMD=(xsel --clipboard --input)
+    else
+        die "no clipboard tool found (need wl-copy, xclip, or xsel)"
+    fi
+}
+
+run_get() {
+    # One API call per attempt: every field base64-encoded onto its own line
+    # (labels/assignees joined with a unit separator), so multiline bodies and
+    # empty fields survive the trip without a jq dependency.
+    local jq_fields='[.title, (.body // ""), .state, (.author.login // ""), ([.labels[].name] | join("\u001f")), ([.assignees[].login] | join("\u001f")), (.milestone.title // ""), .url, .createdAt, .updatedAt'
+    local fields="" gtype=""
+    if [[ "$OPT_TYPE" != "pr" ]]; then
+        if fields=$(gh issue view "$NUMBER" --repo "$REPO" \
+                --json title,body,state,author,labels,assignees,milestone,url,createdAt,updatedAt \
+                --jq "${jq_fields}] | .[] | @base64" 2>/dev/null); then
+            gtype="issue"
+        fi
+    fi
+    if [[ -z "$gtype" && "$OPT_TYPE" != "issue" ]]; then
+        if fields=$(gh pr view "$NUMBER" --repo "$REPO" \
+                --json title,body,state,author,labels,assignees,milestone,url,createdAt,updatedAt,baseRefName \
+                --jq "${jq_fields}, .baseRefName] | .[] | @base64" 2>/dev/null); then
+            gtype="pr"
+        fi
+    fi
+    [[ -n "$gtype" ]] || die "#$NUMBER not found on $REPO${OPT_TYPE:+ as a $OPT_TYPE}"
+    TYPE="$gtype"
+
+    local enc=()
+    mapfile -t enc <<< "$fields"
+    local want=10
+    [[ "$TYPE" == "pr" ]] && want=11
+    [[ ${#enc[@]} -eq $want ]] || die "unexpected gh output while fetching $TYPE #$NUMBER"
+
+    local title body state author milestone url created updated base=""
+    title=$(b64dec "${enc[0]}")
+    body=$(b64dec "${enc[1]}")
+    state=$(b64dec "${enc[2]}")
+    author=$(b64dec "${enc[3]}")
+    milestone=$(b64dec "${enc[6]}")
+    url=$(b64dec "${enc[7]}")
+    created=$(b64dec "${enc[8]}")
+    updated=$(b64dec "${enc[9]}")
+    [[ "$TYPE" == "pr" ]] && base=$(b64dec "${enc[10]}")
+    body="${body//$'\r'/}"
+
+    local labels=() assignees=() joined
+    joined=$(b64dec "${enc[4]}")
+    [[ -n "$joined" ]] && IFS=$'\x1f' read -ra labels <<< "$joined"
+    joined=$(b64dec "${enc[5]}")
+    [[ -n "$joined" ]] && IFS=$'\x1f' read -ra assignees <<< "$joined"
+
+    local bb_nums=()
+    if [[ "$TYPE" == "issue" ]]; then
+        mapfile -t bb_nums < <(bb_current_pairs "$NUMBER" | cut -f1 | sort -n)
+    fi
+
+    local content
+    if [[ "$BODY_ONLY" == true || "$CLIP" == true ]]; then
+        content="$body"
+    else
+        content=$(
+            printf -- '---\n'
+            printf 'title: "%s"\n' "${title//\"/\\\"}"
+            printf 'repo: %s\n' "$REPO"
+            printf 'labels: %s\n' "$(inline_str_list "${labels[@]}")"
+            printf 'assignees: %s\n' "$(inline_str_list "${assignees[@]}")"
+            if [[ -n "$milestone" ]]; then printf 'milestone: "%s"\n' "${milestone//\"/\\\"}"; fi
+            if [[ "$TYPE" == "pr" ]]; then printf 'base: %s\n' "$base"; fi
+            if [[ "$TYPE" == "issue" ]]; then printf 'blocked_by: %s\n' "$(inline_num_list "${bb_nums[@]}")"; fi
+            printf '%s: %s\n' "$TYPE" "$NUMBER"
+            printf 'filing: done   # todo | ready | done\n'
+            printf '# GitHub metadata (informational; not consumed by gh-draft):\n'
+            printf 'state: %s\n' "$state"
+            printf 'author: %s\n' "$author"
+            printf 'url: %s\n' "$url"
+            printf 'created: %s\n' "$created"
+            printf 'updated: %s\n' "$updated"
+            printf -- '---\n'
+            printf '%s\n' "$body"
+        )
+    fi
+
+    if [[ "$CLIP" == true ]]; then
+        pick_clip_cmd
+        printf '%s\n' "$content" | "${CLIP_CMD[@]}"
+        info "Copied the body of $TYPE #$NUMBER ($title) to the clipboard ($(printf '%s\n' "$content" | wc -l) lines)."
+        return 0
+    fi
+    if [[ "$DEST" == "-" ]]; then
+        printf '%s\n' "$content"
+        return 0
+    fi
+
+    local slug out
+    slug=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//')
+    [[ -n "$slug" ]] || slug="$TYPE-$NUMBER"
+    if [[ -z "$DEST" ]]; then
+        out="$slug.md"
+    elif [[ -d "$DEST" || "$DEST" == */ ]]; then
+        out="${DEST%/}/$slug.md"
+    else
+        out="$DEST"
+    fi
+    if [[ -e "$out" && "$FORCE" != true ]]; then
+        die "$out already exists (pass -f to overwrite)"
+    fi
+    mkdir -p "$(dirname "$out")"
+    printf '%s\n' "$content" > "$out"
+    echo "Wrote $out ($TYPE #$NUMBER, $state, @$author)"
+    if [[ "$BODY_ONLY" != true ]]; then
+        info "The draft round-trips: edit it, set filing: ready, and run 'gh-draft $out' to push changes."
+    fi
+    return 0
+}
+
+# --- create -----------------------------------------------------------------
+
+# After a successful create: record the new number in the draft (so a re-run
+# updates instead of duplicating), flip 'filing: done' if the draft tracks it,
+# and keep or delete the file.
+finish_draft_after_create() {
+    local num="$1"
+    if [[ "$DELETE_DRAFT" == true ]]; then
+        rm "$DRAFT"
+        info "Deleted draft: $DRAFT"
+        return 0
+    fi
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+        draft_set_field "$DRAFT" "$TYPE" "$num"
+        info "Recorded $TYPE: $num in the draft (a re-run now updates instead of duplicating)."
+    else
+        info "Warning: could not parse the new number from the URL; not recorded in the draft."
+    fi
+    if fm_has filing; then
+        draft_set_field "$DRAFT" filing "done"
+        info "Marked filing: done."
+    fi
+    info "Kept draft: $DRAFT"
+}
+
+create_issue() {
+    local args=(--repo "$REPO" --title "$TITLE" --body "$BODY")
+    local l a
+    for l in "${LABELS[@]}"; do args+=(--label "$l"); done
+    for a in "${ASSIGNEES[@]}"; do args+=(--assignee "$a"); done
+    if [[ -n "$MILESTONE" ]]; then args+=(--milestone "$MILESTONE"); fi
+
+    info "Creating issue on $REPO: $TITLE"
+    if [[ ${#LABELS[@]} -gt 0 ]]; then info "Labels: ${LABELS[*]}"; fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[dry-run] would create: ${#LABELS[@]} label(s), ${#ASSIGNEES[@]} assignee(s)${MILESTONE:+, milestone '$MILESTONE'}, $(printf '%s\n' "$BODY" | wc -l) body line(s)"
+        if [[ ${#BLOCKED_BY[@]} -gt 0 ]]; then info "[dry-run] would set blocked_by: ${BLOCKED_BY[*]/#/#}"; fi
+        info "[dry-run] nothing created."
+        return 0
+    fi
+
+    local url num
+    url=$(gh issue create "${args[@]}" | tail -n 1)
+    echo "Created: $url"
+    num="${url##*/}"
+
+    # A new issue starts with no dependencies, so this only adds.
+    local deps_ok=true bn bid
+    if [[ ${#BLOCKED_BY[@]} -gt 0 && "$num" =~ ^[0-9]+$ ]]; then
+        info "Setting blocked_by on #$num: ${BLOCKED_BY[*]/#/#}"
+        for bn in "${BLOCKED_BY[@]}"; do
+            if [[ "$bn" == "$num" ]]; then
+                info "  skip #$bn (an issue cannot block itself)"
+                continue
+            fi
+            if ! bid=$(bb_resolve_id "$bn"); then
+                info "  skip #$bn (issue not found on $REPO)"
+                deps_ok=false
+                continue
+            fi
+            if bb_add "$num" "$bid"; then
+                info "  blocked by #$bn"
+            else
+                info "  could not add #$bn (does the token have Issues: write?)"
+                deps_ok=false
+            fi
+        done
+    fi
+
+    finish_draft_after_create "$num"
+    if [[ "$deps_ok" != true ]]; then
+        info "Warning: some blocked_by dependencies were not set; re-run to reconcile (the draft now updates #$num)."
+        exit 1
+    fi
+}
+
+create_pr() {
+    command -v git >/dev/null 2>&1 || die "git is required to create a PR"
+
+    local branch base
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null || true)
+    [[ -n "$branch" ]] || die "detached HEAD — check out a branch first"
+    if [[ "$branch" == "main" || "$branch" == "master" ]]; then
+        die "refusing to create a PR from '$branch' — use a feature branch"
+    fi
+
+    base=$(fm_token base)
+    if [[ -z "$base" ]]; then
+        base=$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null) || true
+        base="${base:-main}"
+    fi
+
+    local args=(--repo "$REPO" --title "$TITLE" --base "$base" --body "$BODY")
+    local l a r
+    for l in "${LABELS[@]}"; do args+=(--label "$l"); done
+    for a in "${ASSIGNEES[@]}"; do args+=(--assignee "$a"); done
+    for r in "${REVIEWERS[@]}"; do args+=(--reviewer "$r"); done
+    if [[ -n "$MILESTONE" ]]; then args+=(--milestone "$MILESTONE"); fi
+    if [[ "$(fm_token draft)" == "true" ]]; then args+=(--draft); fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[dry-run] would push '$branch' and create a PR on $REPO: $TITLE (base: $base); nothing pushed or created."
+        return 0
+    fi
+
+    if git rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+        info "Pushing to the existing upstream..."
+        git push
+    else
+        info "Pushing and setting upstream..."
+        git push -u origin "$branch"
+    fi
+
+    info "Creating PR on $REPO: $TITLE (base: $base)"
+    local url num
+    url=$(gh pr create "${args[@]}" | tail -n 1)
+    echo "Created: $url"
+    num="${url##*/}"
+    finish_draft_after_create "$num"
+}
+
+# --- update -----------------------------------------------------------------
+
+run_update() {
+    local cmd="issue"
+    [[ "$TYPE" == "pr" ]] && cmd="pr"
+
+    local state me author gh_title cur_body
+    state=$(gh "$cmd" view "$NUMBER" --repo "$REPO" --json state --jq '.state' 2>/dev/null) || \
+        die "$TYPE #$NUMBER not found on $REPO (check the draft's '$TYPE:' field)"
+
+    # Refuse to overwrite someone else's issue/PR: a wrong or stale number
+    # would otherwise clobber it, since the edit below is unconditional.
+    me=$(gh api user --jq '.login' 2>/dev/null) || true
+    [[ -n "$me" ]] || die "could not determine the authenticated GitHub user (gh api user failed); refusing to update"
+    author=$(gh "$cmd" view "$NUMBER" --repo "$REPO" --json author --jq '.author.login // ""' 2>/dev/null) || true
+    if [[ "$author" != "$me" ]]; then
+        die "refusing to update $TYPE #$NUMBER: authored by '${author:-<unknown>}', not you ('$me') — gh-draft only edits your own ${TYPE}s"
+    fi
+
+    gh_title=$(gh "$cmd" view "$NUMBER" --repo "$REPO" --json title --jq '.title' 2>/dev/null) || true
+    cur_body=$(gh "$cmd" view "$NUMBER" --repo "$REPO" --json body --jq '.body' 2>/dev/null) || true
+    cur_body="${cur_body//$'\r'/}"
+
+    local cur_labels=() cur_assignees=()
+    mapfile -t cur_labels < <(gh "$cmd" view "$NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null)
+    mapfile -t cur_assignees < <(gh "$cmd" view "$NUMBER" --repo "$REPO" --json assignees --jq '.assignees[].login' 2>/dev/null)
+
+    # --- compute every change up front, so the preview shows the full picture
+
+    # Add-only: draft labels/assignees not already present; nothing is removed.
+    local labels_add=() assignees_add=() l a c present
+    for l in "${LABELS[@]}"; do
+        present=false
+        for c in "${cur_labels[@]}"; do [[ "$c" == "$l" ]] && { present=true; break; }; done
+        $present || labels_add+=("$l")
+    done
+    for a in "${ASSIGNEES[@]}"; do
+        present=false
+        for c in "${cur_assignees[@]}"; do [[ "$c" == "$a" ]] && { present=true; break; }; done
+        $present || assignees_add+=("$a")
+    done
+
+    local title_changed=false body_changed=false
+    [[ "$TITLE" != "$gh_title" ]] && title_changed=true
+    [[ "$BODY" != "$cur_body" ]] && body_changed=true
+
+    # blocked_by delta, only when the draft manages the field.
+    local bb_add_nums=() extra_nums=() extra_ids=() do_remove=false
+    if [[ "$MANAGE_BB" == true ]]; then
+        local cur_nums=() cur_ids=() des_nums=() cn cid dn i wanted
+        while IFS=$'\t' read -r cn cid; do
+            [[ -n "$cn" ]] && { cur_nums+=("$cn"); cur_ids+=("$cid"); }
+        done < <(bb_current_pairs "$NUMBER")
+        for dn in "${BLOCKED_BY[@]}"; do
+            if [[ "$dn" == "$NUMBER" ]]; then
+                info "Note: draft lists #$NUMBER as its own blocker; ignoring."
+                continue
+            fi
+            des_nums+=("$dn")
+        done
+        for dn in "${des_nums[@]}"; do
+            present=false
+            for cn in "${cur_nums[@]}"; do [[ "$cn" == "$dn" ]] && { present=true; break; }; done
+            $present || bb_add_nums+=("$dn")
+        done
+        for i in "${!cur_nums[@]}"; do
+            wanted=false
+            for dn in "${des_nums[@]}"; do [[ "$dn" == "${cur_nums[$i]}" ]] && { wanted=true; break; }; done
+            $wanted || { extra_nums+=("${cur_nums[$i]}"); extra_ids+=("${cur_ids[$i]}"); }
+        done
+        if [[ "$PRUNE_DEPS" == true && ${#extra_nums[@]} -gt 0 ]]; then do_remove=true; fi
+    fi
+
+    # --- preview ---
+    info "=== changes for $TYPE #$NUMBER [$state] on $REPO: $gh_title ==="
+    if $title_changed; then info "  title:      CHANGE -> $TITLE"; else info "  title:      unchanged"; fi
+    if $body_changed; then info "  body:       CHANGE (word-diff below)"; else info "  body:       unchanged"; fi
+    if [[ ${#labels_add[@]} -gt 0 ]]; then
+        info "  labels:     ADD ${labels_add[*]} (existing labels kept)"
+    else
+        info "  labels:     unchanged"
+    fi
+    if [[ ${#assignees_add[@]} -gt 0 ]]; then
+        info "  assignees:  ADD ${assignees_add[*]} (existing assignees kept)"
+    else
+        info "  assignees:  unchanged"
+    fi
+    if [[ "$TYPE" == "issue" ]]; then
+        if [[ "$MANAGE_BB" != true ]]; then
+            info "  blocked_by: unmanaged (draft has no blocked_by field)"
+        elif [[ ${#bb_add_nums[@]} -eq 0 && "$do_remove" == false && ${#extra_nums[@]} -eq 0 ]]; then
+            info "  blocked_by: unchanged (in sync)"
+        else
+            local bbline="  blocked_by:"
+            [[ ${#bb_add_nums[@]} -gt 0 ]] && bbline+=" ADD ${bb_add_nums[*]/#/#}"
+            if [[ "$do_remove" == true ]]; then
+                bbline+=" | REMOVE ${extra_nums[*]/#/#} (--prune-deps)"
+            elif [[ ${#extra_nums[@]} -gt 0 ]]; then
+                bbline+=" | ${extra_nums[*]/#/#} on GitHub not in draft, KEPT (pass --prune-deps to remove)"
+            fi
+            info "$bbline"
+        fi
+    fi
+
+    if $body_changed && command -v git >/dev/null 2>&1; then
+        local diff_dir word_diff
+        diff_dir=$(mktemp -d)
+        printf '%s\n' "$cur_body" > "$diff_dir/current"
+        printf '%s\n' "$BODY" > "$diff_dir/new"
+        if [[ -t 2 ]]; then word_diff="--word-diff=color"; else word_diff="--word-diff=plain"; fi
+        info "--- body word-diff for #$NUMBER (current vs draft) ---"
+        git --no-pager diff --no-index "$word_diff" -- "$diff_dir/current" "$diff_dir/new" >&2 || true
+        info "--- end of diff ---"
+        rm -rf "$diff_dir"
+    fi
+
+    local content_change=false bb_change=false
+    if $title_changed || $body_changed || [[ ${#labels_add[@]} -gt 0 || ${#assignees_add[@]} -gt 0 ]]; then
+        content_change=true
+    fi
+    if [[ ${#bb_add_nums[@]} -gt 0 || "$do_remove" == true ]]; then bb_change=true; fi
+
+    if [[ "$content_change" == false && "$bb_change" == false ]]; then
+        info "Nothing to update; $TYPE #$NUMBER already matches the draft."
+        if [[ "$DRY_RUN" != true ]] && fm_has filing; then
+            draft_set_field "$DRAFT" filing "done"
+            info "Marked filing: done (already in sync)."
+        fi
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[dry-run] nothing applied."
+        return 0
+    fi
+
+    confirm "Apply these changes to $TYPE #$NUMBER on $REPO?" || {
+        info "Aborted; #$NUMBER unchanged."
+        return 0
+    }
+
+    # Only a fully applied update flips the draft to filing: done.
+    local fully_applied=true url
+    if [[ "$content_change" == true ]]; then
+        local edit_args=(--repo "$REPO" --title "$TITLE" --body "$BODY")
+        for l in "${labels_add[@]}"; do edit_args+=(--add-label "$l"); done
+        for a in "${assignees_add[@]}"; do edit_args+=(--add-assignee "$a"); done
+        if url=$(gh "$cmd" edit "$NUMBER" "${edit_args[@]}"); then
+            echo "Updated #$NUMBER: $url"
+        else
+            info "  ! could not update title/body/labels (does the token have write access?)"
+            fully_applied=false
+        fi
+    fi
+
+    if [[ "$bb_change" == true ]]; then
+        local bn bid i
+        for bn in "${bb_add_nums[@]}"; do
+            if ! bid=$(bb_resolve_id "$bn"); then
+                info "  skip add #$bn (issue not found)"
+                fully_applied=false
+                continue
+            fi
+            if bb_add "$NUMBER" "$bid"; then
+                info "  + blocked by #$bn"
+            else
+                info "  ! could not add #$bn (does the token have Issues: write?)"
+                fully_applied=false
+            fi
+        done
+        if [[ "$do_remove" == true ]]; then
+            for i in "${!extra_nums[@]}"; do
+                if bb_remove "$NUMBER" "${extra_ids[$i]}"; then
+                    info "  - removed blocker #${extra_nums[$i]}"
+                else
+                    info "  ! could not remove #${extra_nums[$i]}"
+                    fully_applied=false
+                fi
+            done
+        fi
+    fi
+
+    if [[ "$fully_applied" != true ]]; then
+        info "Some changes were not applied; re-run to finish."
+        exit 1
+    fi
+    if fm_has filing; then
+        draft_set_field "$DRAFT" filing "done"
+        info "Marked filing: done."
+    fi
+    if [[ "$DELETE_DRAFT" == true ]]; then
+        rm "$DRAFT"
+        info "Deleted draft: $DRAFT"
+    else
+        info "Kept draft: $DRAFT"
+    fi
+    return 0
+}
+
+# --- option parsing ---------------------------------------------------------
+
+OPT_REPO=""
+OPT_TYPE=""
+DELETE_DRAFT=false
+ASSUME_YES=false
+DRY_RUN=false
+PRUNE_DEPS=false
+ALLOW_DONE=false
+STRIP_SECTIONS=()
+POSITIONAL=()
+GET_MODE=false
+CLIP=false
+BODY_ONLY=false
+FORCE=false
+DEST=""
+NUMBER=""
+
+if [[ "${1:-}" == "get" ]]; then
+    GET_MODE=true
+    shift
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -R|--repo)       [[ $# -ge 2 ]] || die "$1 requires an argument"; OPT_REPO="$2"; shift 2 ;;
+        -t|--type)       [[ $# -ge 2 ]] || die "$1 requires an argument"; OPT_TYPE="$2"; shift 2 ;;
+        -d|--delete)     DELETE_DRAFT=true; shift ;;
+        -k|--keep)       DELETE_DRAFT=false; shift ;;
+        -c|--clip)       CLIP=true; shift ;;
+        -b|--body-only)  BODY_ONLY=true; shift ;;
+        -f|--force)      FORCE=true; shift ;;
+        -y|--yes)        ASSUME_YES=true; shift ;;
+        -n|--dry-run)    DRY_RUN=true; shift ;;
+        --prune-deps)    PRUNE_DEPS=true; shift ;;
+        --allow-done)    ALLOW_DONE=true; shift ;;
+        --strip-section) [[ $# -ge 2 ]] || die "$1 requires an argument"; STRIP_SECTIONS+=("$2"); shift 2 ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; POSITIONAL+=("$@"); break ;;
+        -)               POSITIONAL+=("$1"); shift ;;
+        -*)              echo "Unknown option: $1" >&2; usage_short; exit 2 ;;
+        *)               POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+case "$OPT_TYPE" in ""|issue|pr) ;; *) die "--type must be 'issue' or 'pr'" ;; esac
+command -v gh >/dev/null 2>&1 || die "gh is required"
+
+if [[ "$GET_MODE" == true ]]; then
+    [[ ${#POSITIONAL[@]} -ge 1 && ${#POSITIONAL[@]} -le 2 ]] || { usage_short; exit 2; }
+    NUMBER="${POSITIONAL[0]}"
+    [[ "$NUMBER" =~ ^[0-9]+$ ]] || die "issue/PR number must be numeric, got '$NUMBER'"
+    DEST="${POSITIONAL[1]:-}"
+    if [[ "$CLIP" == true && -n "$DEST" ]]; then
+        die "--clip and a destination are mutually exclusive"
+    fi
+    REPO="$OPT_REPO"
+    if [[ -z "$REPO" ]]; then
+        REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) || true
+        [[ -n "$REPO" ]] || die "cannot determine the target repository: run inside a GitHub repo or pass -R owner/repo"
+    fi
+    [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "invalid repository '$REPO' (expected owner/repo)"
+    run_get
+    exit 0
+fi
+
+if [[ "$CLIP" == true || "$BODY_ONLY" == true || "$FORCE" == true ]]; then
+    die "--clip/--body-only/--force are only valid with 'gh-draft get'"
+fi
+[[ ${#POSITIONAL[@]} -eq 1 ]] || { usage_short; exit 2; }
+DRAFT="${POSITIONAL[0]}"
+[[ -f "$DRAFT" ]] || die "file not found: $DRAFT"
+
+# --- load the draft ---------------------------------------------------------
+
+[[ "$(head -n 1 "$DRAFT")" == "---" ]] || die "$DRAFT does not start with '---' YAML frontmatter (at least a 'title:' field is required)"
+[[ "$(grep -c '^---$' "$DRAFT")" -ge 2 ]] || die "$DRAFT has unterminated frontmatter (no closing '---')"
+
+FRONTMATTER=$(awk 'BEGIN { n = 0 } /^---$/ { n++; if (n == 2) exit; next } n == 1 { print }' "$DRAFT")
+# Body = everything after the second '---', verbatim (later '---' lines are
+# body content, e.g. horizontal rules).
+BODY=$(awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n == 2 { print }' "$DRAFT")
+
+TITLE=$(fm_value title)
+[[ -n "$TITLE" ]] || die "no title found in frontmatter"
+
+# Filing gate: when the draft tracks a 'filing:' field, only 'ready' drafts
+# are published. Drafts without the field always publish.
+FILING=$(fm_token filing)
+if fm_has filing; then
+    case "$FILING" in
+        ready) ;;
+        done)
+            if [[ "$ALLOW_DONE" != true ]]; then
+                info "Skipping $DRAFT: filing is 'done' (already filed; pass --allow-done to act anyway)."
+                exit 0
+            fi
+            confirm "Draft is marked filing: done. Act on it anyway?" || { info "Aborted."; exit 0; }
+            ;;
+        *)
+            info "Skipping $DRAFT: filing is '${FILING:-<unset>}' (only 'filing: ready' drafts are published)."
+            exit 0
+            ;;
+    esac
+fi
+
+# --- resolve type, mode, and repo -------------------------------------------
+
+TYPE="$OPT_TYPE"
+if [[ -z "$TYPE" ]]; then TYPE=$(fm_token type); fi
+if [[ -z "$TYPE" ]]; then
+    if fm_has pr || fm_has base || fm_has reviewers; then
+        TYPE="pr"
+    elif fm_has issue; then
+        TYPE="issue"
+    else
+        case "$DRAFT" in *.prs/*) TYPE="pr" ;; *) TYPE="issue" ;; esac
+    fi
+fi
+case "$TYPE" in issue|pr) ;; *) die "unknown type '$TYPE' (expected 'issue' or 'pr')" ;; esac
+
+# The recorded number ('issue:' or 'pr:') selects update mode.
+NUMBER=$(fm_token "$TYPE")
+if [[ -n "$NUMBER" && ! "$NUMBER" =~ ^[0-9]+$ ]]; then
+    die "'$TYPE:' field is not a number: $NUMBER"
+fi
+MODE="create"
+[[ -n "$NUMBER" ]] && MODE="update"
+
+REPO="$OPT_REPO"
+if [[ -z "$REPO" ]]; then REPO=$(fm_token repo); fi
+if [[ -z "$REPO" ]]; then
+    REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) || true
+    [[ -n "$REPO" ]] || die "cannot determine the target repository: run inside a GitHub repo or pass -R owner/repo"
+fi
+[[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "invalid repository '$REPO' (expected owner/repo)"
+
+# --- prepare the published body and metadata --------------------------------
+
+mapfile -t FM_STRIP < <(fm_list strip_sections)
+STRIP_SECTIONS+=("${FM_STRIP[@]}")
+for sec in "${STRIP_SECTIONS[@]}"; do
+    BODY=$(printf '%s\n' "$BODY" | awk -v name="$sec" '
+        { t = $0; sub(/[[:space:]]+$/, "", t) }
+        t == "## " name { skip = 1; next }
+        /^## / { skip = 0 }
+        !skip { print }
+    ')
+done
+
+mapfile -t LABELS < <(fm_list labels)
+mapfile -t ASSIGNEES < <(fm_list assignees)
+mapfile -t REVIEWERS < <(fm_list reviewers)
+MILESTONE=$(fm_value milestone)
+
+# blocked_by distinguishes "absent" (leave GitHub as-is) from "present but
+# empty" ([] + --prune-deps clears every dependency).
+MANAGE_BB=false
+BLOCKED_BY=()
+if fm_has blocked_by; then
+    if [[ "$TYPE" == "issue" ]]; then
+        MANAGE_BB=true
+        while IFS= read -r n; do
+            n="${n//[^0-9]/}"
+            [[ -n "$n" ]] && BLOCKED_BY+=("$n")
+        done < <(fm_list blocked_by)
+    else
+        info "Note: blocked_by is ignored for PRs."
+    fi
+fi
+if [[ "$TYPE" == "issue" && ${#REVIEWERS[@]} -gt 0 ]]; then
+    info "Note: reviewers is ignored for issues."
+fi
+
+# --- go ---------------------------------------------------------------------
+
+if [[ "$MODE" == "update" ]]; then
+    run_update
+elif [[ "$TYPE" == "pr" ]]; then
+    create_pr
+else
+    create_issue
+fi
