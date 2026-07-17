@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# git-contributors — collect every contributor of a repository, including
+# Co-authored-by trailers, and print per-contributor statistics as CSV on
+# stdout — or, with -c, a ready-to-paste block of Co-authored-by lines for
+# e.g. a squashed commit.
+#
+# By default the whole history of HEAD is scanned; any argument this script
+# does not recognize is passed straight to 'git log', so revision ranges
+# (v1.0..HEAD), --all, --since=..., --no-merges, or '-- <path>' restrictions
+# all work as usual.
+#
+# Identities are canonicalized through .mailmap (authors via git's own %aN/%aE,
+# co-authors via 'git check-mailmap') and deduplicated by email address. A
+# Co-authored-by line naming the commit's own author, or repeated within one
+# commit, is not counted twice.
+
+usage() {
+    cat << 'EOF'
+Usage: git-contributors [options] [<git-log-args>...]
+
+Scan the git history (default: the whole history of HEAD) and print one CSV
+line per contributor on stdout:
+
+  name,email,commits_authored,commits_coauthored,commits_total,authored_pct,first_commit,last_commit
+
+commits_authored counts commits the contributor authored, commits_coauthored
+counts commits that credit them via a Co-authored-by trailer, authored_pct is
+their share of all scanned commits, and first/last_commit are author dates
+(YYYY-MM-DD). Rows are sorted by total involvement. Fields containing commas
+or quotes are quoted per RFC 4180.
+
+Options:
+  -c, --coauthors    print 'Co-authored-by: Name <email>' lines instead of
+                     CSV — paste them into the message of a squashed commit
+                     to credit everyone (contributors without an email
+                     address are skipped, with a note on stderr)
+  -x, --exclude-me   drop the contributor matching your git user.email
+                     (useful with -c: you author the squashed commit anyway)
+  -h, --help         show this help and exit
+
+Anything else is passed to 'git log':
+
+  git-contributors                          whole history, CSV
+  git-contributors v1.0..HEAD               only a range
+  git-contributors --all --since=2025-01-01 all branches, recent commits
+  git-contributors -- src/                  only commits touching src/
+  git-contributors -c -x main..feature      co-author block for squashing
+                                            a feature branch, minus yourself
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+COAUTHOR_MODE=false
+EXCLUDE_ME=false
+GIT_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--coauthors)  COAUTHOR_MODE=true; shift ;;
+        -x|--exclude-me) EXCLUDE_ME=true; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              GIT_ARGS+=("$@"); break ;;
+        *)               GIT_ARGS+=("$1"); shift ;;
+    esac
+done
+
+command -v git >/dev/null 2>&1 || die "git is required"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+
+# Byte-safe field separators: git names can contain almost anything.
+US=$(printf '\037')
+SOH=$(printf '\001')
+export LC_ALL=C
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# Identity to exclude with -x, keyed like the aggregation below (lowercased
+# email, after mailmap).
+EXCLUDE_KEY=""
+if [[ "$EXCLUDE_ME" == true ]]; then
+    me_email=$(git config user.email 2>/dev/null || true)
+    [[ -n "$me_email" ]] || die "--exclude-me: git config user.email is not set"
+    me_name=$(git config user.name 2>/dev/null || true)
+    mapped=$(git check-mailmap "$me_name <$me_email>" 2>/dev/null || true)
+    if [[ "$mapped" =~ \<([^\>]*)\>[[:space:]]*$ ]]; then
+        me_email="${BASH_REMATCH[1]}"
+    fi
+    EXCLUDE_KEY=$(printf '%s' "$me_email" | tr '[:upper:]' '[:lower:]')
+fi
+
+# One SOH-marked line per commit (author name/email/date, mailmapped),
+# followed by that commit's Co-authored-by trailer values, one per line.
+# Our format comes first so a trailing '-- <path>' in GIT_ARGS stays a
+# pathspec.
+git -c log.showSignature=false log \
+    --format="${SOH}%aN${US}%aE${US}%as%x0a%(trailers:key=Co-authored-by,valueonly=true,unfold=true)" \
+    "${GIT_ARGS[@]}" > "$TMP/log"
+
+# -> records: commit-no US type(a|c) US name US email US date
+awk -v US="$US" -v SOH="$SOH" '
+    BEGIN { FS = OFS = US; n = 0; date = "" }
+    index($0, SOH) == 1 {
+        n++
+        date = $3
+        print n, "a", substr($1, 2), $2, date
+        next
+    }
+    {
+        line = $0
+        sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line)
+        if (line == "" || n == 0) next
+        name = line; email = ""
+        if (match(line, /<[^<>]*>$/)) {
+            email = substr(line, RSTART + 1, RLENGTH - 2)
+            name = substr(line, 1, RSTART - 1)
+            sub(/[ \t]+$/, "", name)
+        }
+        print n, "c", name, email, date
+    }
+' "$TMP/log" > "$TMP/records"
+
+# Canonicalize co-author identities through .mailmap (authors already are).
+# maptab: raw "Name <email>" US mapped "Name <email>"; identities missing
+# from the table fall back to themselves.
+awk -v US="$US" 'BEGIN { FS = US } $2 == "c" && $4 != "" { print $3 " <" $4 ">" }' \
+    "$TMP/records" | sort -u > "$TMP/idents"
+if [[ -s "$TMP/idents" ]]; then
+    git check-mailmap --stdin < "$TMP/idents" > "$TMP/mapped" 2>/dev/null || true
+    paste -d "$US" "$TMP/idents" "$TMP/mapped" > "$TMP/maptab"
+else
+    : > "$TMP/maptab"
+fi
+
+# Aggregate per contributor (keyed by lowercased email; name-only entries by
+# name), then sort by total involvement, authored count, name.
+awk -v US="$US" -v exclude="$EXCLUDE_KEY" '
+    BEGIN { FS = OFS = US }
+    FILENAME == ARGV[1] { if ($1 != "" && $2 != "") map[$1] = $2; next }
+    {
+        commit = $1; type = $2; name = $3; email = $4; date = $5
+        if (type == "c" && email != "") {
+            ident = name " <" email ">"
+            if (ident in map) {
+                m = map[ident]
+                if (match(m, /<[^<>]*>$/)) {
+                    email = substr(m, RSTART + 1, RLENGTH - 2)
+                    name = substr(m, 1, RSTART - 1)
+                    sub(/[ \t]+$/, "", name)
+                }
+            }
+        }
+        key = tolower(email)
+        if (key == "") key = "name:" tolower(name)
+        if (type == "a") { commits++; author[commit] = key }
+        if (exclude != "" && key == exclude) next
+        if (type == "c") {
+            if (author[commit] == key) next      # self-co-author
+            if ((commit, key) in cseen) next     # duplicate trailer
+            cseen[commit, key] = 1
+        }
+        if (!(key in total)) { name_of[key] = name; email_of[key] = email }
+        if (name_of[key] == "" && name != "") name_of[key] = name
+        total[key]++
+        if (type == "a") authored[key]++
+        if (type == "c") coauthored[key]++
+        if (first[key] == "" || date < first[key]) first[key] = date
+        if (last[key] == "" || date > last[key]) last[key] = date
+    }
+    END {
+        for (key in total) {
+            pct = commits > 0 ? sprintf("%.1f", 100 * authored[key] / commits) : "0.0"
+            print total[key], authored[key] + 0, coauthored[key] + 0,
+                  name_of[key], email_of[key], first[key], last[key], pct
+        }
+    }
+' "$TMP/maptab" "$TMP/records" |
+    sort -t "$US" -k1,1nr -k2,2nr -k4,4f > "$TMP/stats"
+
+if [[ "$COAUTHOR_MODE" == true ]]; then
+    awk -v US="$US" '
+        BEGIN { FS = US }
+        $5 != "" { print "Co-authored-by: " ($4 != "" ? $4 " " : "") "<" $5 ">" }
+        $5 == "" { skipped++ }
+        END {
+            if (skipped)
+                print "note: skipped " skipped " contributor(s) without an email address" > "/dev/stderr"
+        }
+    ' "$TMP/stats"
+else
+    awk -v US="$US" '
+        function csv(s) {
+            if (s ~ /[",]/) { gsub(/"/, "\"\"", s); s = "\"" s "\"" }
+            return s
+        }
+        BEGIN {
+            FS = US
+            print "name,email,commits_authored,commits_coauthored,commits_total,authored_pct,first_commit,last_commit"
+        }
+        { print csv($4) "," csv($5) "," $2 "," $3 "," $1 "," $8 "," $6 "," $7 }
+    ' "$TMP/stats"
+fi
