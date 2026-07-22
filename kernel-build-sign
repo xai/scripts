@@ -15,6 +15,8 @@
 #   mok-setup            one-time: generate a signing key + import it (then reboot to enroll)
 #   build <ver|tarball>  download/compile a kernel, install, sign, verify (keeps the old kernel)
 #   sign  <kver>         MOK-sign an already-installed /boot/vmlinuz-<kver> (e.g. a mainline .deb)
+#   list                 show self-built kernels + their disk usage (dpkg-managed ones are hidden)
+#   remove <kver>        delete a self-built kernel; refuses the running one and dpkg-managed ones
 #
 # Env overrides: MOK_DIR, KERNEL_BUILD_DIR, KERNEL_BUILD_LOG, JOBS, LOCALVERSION
 set -euo pipefail
@@ -225,13 +227,108 @@ cmd_build() {
    4. journalctl -k | grep -iE 'refclk|tearing down'   (the regression should be gone)
    5. dock the externals and confirm DP-4/DP-5 come up.
  If anything misbehaves: reboot and pick $(uname -r). Nothing was removed.
+ Once $krel has proven itself:  $0 list  /  $0 remove <old-kver>  frees the disk.
 ============================================================================
 EOF
+}
+
+# 'build' installs plain files that no dpkg package owns; distro kernels are
+# dpkg-owned. list/remove key on that ownership test so they can never touch an
+# apt-managed kernel (incl. mainline .debs signed via 'sign' — remove with apt).
+is_dpkg_owned() { command -v dpkg >/dev/null 2>&1 && dpkg -S "$1" >/dev/null 2>&1; }
+
+our_kernels() {
+  local img
+  for img in /boot/vmlinuz-*; do
+    [[ -e "$img" ]] || continue
+    is_dpkg_owned "$img" || printf '%s\n' "${img#/boot/vmlinuz-}"
+  done
+}
+
+cmd_list() {
+  local kvers=() orphans=() kver d sig boot_sz mod_sz mark
+  mapfile -t kvers < <(our_kernels)
+  # module trees whose /boot image is already gone (half-removed kernels) still
+  # eat hundreds of MB — surface those too
+  for d in /lib/modules/*/; do
+    kver="$(basename -- "$d")"
+    [[ -e "/boot/vmlinuz-$kver" ]] && continue
+    is_dpkg_owned "/lib/modules/$kver" || orphans+=("$kver")
+  done
+  if ((${#kvers[@]} == 0 && ${#orphans[@]} == 0)); then
+    info "No self-built kernels found (dpkg-managed kernels are not shown)."
+    return 0
+  fi
+  info "Self-built kernels (dpkg-managed ones are hidden; clean up with: $0 remove <kver>)"
+  for kver in "${kvers[@]}"; do
+    sig="?"
+    if [[ -f "$MOK_PEM" ]] && command -v sbverify >/dev/null 2>&1; then
+      if sbverify --cert "$MOK_PEM" "/boot/vmlinuz-$kver" >/dev/null 2>&1; then
+        sig="MOK-signed"
+      else
+        sig="not MOK-signed"
+      fi
+    fi
+    boot_sz="$(du -shc "/boot/vmlinuz-$kver" "/boot/initrd.img-$kver" \
+      "/boot/System.map-$kver" "/boot/config-$kver" 2>/dev/null | awk 'END{print $1}')" || true
+    mod_sz="$(du -sh "/lib/modules/$kver" 2>/dev/null | cut -f1)" || true
+    mark=""
+    [[ "$kver" == "$(uname -r)" ]] && mark="  <- running"
+    printf '  %-30s %-15s boot: %-7s modules: %-7s%s\n' \
+      "$kver" "$sig" "${boot_sz:-?}" "${mod_sz:-none}" "$mark"
+  done
+  for kver in "${orphans[@]}"; do
+    mod_sz="$(du -sh "/lib/modules/$kver" 2>/dev/null | cut -f1)" || true
+    mark=""
+    [[ "$kver" == "$(uname -r)" ]] && mark="  <- running"
+    printf '  %-30s %-15s boot: %-7s modules: %-7s (orphaned module tree)%s\n' \
+      "$kver" "-" "-" "${mod_sz:-?}" "$mark"
+  done
+}
+
+cmd_remove() {
+  local kver="${1:?usage: $0 remove <kver>   (see: $0 list)}"
+  # $kver ends up in 'rm -rf' paths under /boot and /lib/modules — insist it
+  # looks like a kernel release, not a path
+  [[ "$kver" =~ ^[0-9][A-Za-z0-9.+_-]*$ ]] || die "implausible kernel release: '$kver'"
+  [[ "$kver" != "$(uname -r)" ]] || die "refusing to remove the RUNNING kernel $kver — boot another one first"
+
+  local paths=() p owner
+  for p in "/boot/vmlinuz-$kver" "/boot/initrd.img-$kver" "/boot/System.map-$kver" \
+           "/boot/config-$kver" "/lib/modules/$kver"; do
+    [[ -e "$p" ]] && paths+=("$p")
+  done
+  ((${#paths[@]} > 0)) || die "nothing installed for $kver (see: $0 list)"
+  for p in "${paths[@]}"; do
+    if owner="$(dpkg -S "$p" 2>/dev/null)"; then
+      die "refusing: $p belongs to dpkg package '${owner%%:*}' — remove that kernel with apt instead"
+    fi
+  done
+  if [[ -e "/boot/vmlinuz-$kver" ]]; then
+    local others=0 f
+    for f in /boot/vmlinuz-*; do
+      [[ -e "$f" && "$f" != "/boot/vmlinuz-$kver" ]] && others=$((others+1))
+    done
+    ((others > 0)) || die "refusing: vmlinuz-$kver is the only kernel in /boot — nothing left to boot"
+  fi
+
+  local total ans
+  total="$(du -shc "${paths[@]}" 2>/dev/null | awk 'END{print $1}')" || true
+  info "Removing kernel $kver (${total:-?} on disk):"
+  printf '    %s\n' "${paths[@]}"
+  read -rp "Remove kernel $kver? [y/N] " ans
+  [[ "$ans" == [yY]* ]] || die "aborted."
+  sudo rm -rf -- "${paths[@]}"
+  info "Refreshing GRUB"
+  sudo update-grub
+  info "Removed $kver. (Tarballs + source trees in $BUILD_DIR are untouched.)"
 }
 
 case "${1:-help}" in
   mok-setup) shift; cmd_mok_setup "$@" ;;
   build)     shift; cmd_build "$@" ;;
   sign)      shift; cmd_sign "$@" ;;
-  *) sed -n '3,30p' "$0"; exit 0 ;;
+  list)      shift; cmd_list "$@" ;;
+  remove)    shift; cmd_remove "$@" ;;
+  *) sed -n '3,32p' "$0"; exit 0 ;;
 esac
