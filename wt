@@ -42,6 +42,7 @@ Commands:
               wt open-pr <number>
               Resolves the PR's head branch via gh, checks it out as a worktree
               if needed (forks use a pr-<number> branch), then opens like 'open'.
+              The window is named '[PR #<number>] <branch>'.
     close     Close the tmux window(s) of a worktree and lock it:
               wt close <worktree>
               <worktree> may be a path, branch name, or directory name.
@@ -1065,9 +1066,16 @@ open_window() {
 
     local wt_path="$RESOLVED_PATH" branch="$RESOLVED_BRANCH"
 
+    # Optional second argument: a prefix for the window name, e.g. open-pr
+    # tags its windows with "[PR #<number>]".
+    local name_prefix="${2:-}"
+
     local win_name="$branch"
     if [ -z "$win_name" ] || [ "$win_name" = "(detached)" ]; then
         win_name=$(basename "$wt_path")
+    fi
+    if [ -n "$name_prefix" ]; then
+        win_name="$name_prefix $win_name"
     fi
 
     # Open a new window rooted at the worktree and carve it into panes, all
@@ -1171,7 +1179,7 @@ open_pr() {
     local existing
     if existing=$(worktree_path_for_branch "$branch"); then
         echo "Worktree for PR #$pr already exists: $existing"
-        open_window "$branch"
+        open_window "$branch" "[PR #$pr]"
         return
     fi
 
@@ -1212,7 +1220,7 @@ open_pr() {
         fi
     fi
 
-    open_window "$branch"
+    open_window "$branch" "[PR #$pr]"
 }
 
 close_window() {
