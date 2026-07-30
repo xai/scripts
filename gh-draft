@@ -49,8 +49,10 @@ Options:
       --prune-deps        update: also REMOVE blocked_by dependencies that
                           the draft omits (default: add-only)
       --allow-done        also act on a draft marked 'filing: done'
-      --strip-section H   drop the '## H' section from the published body
-                          (repeatable; heading text without the '## ')
+      --strip-section H   drop the 'H' section from the published body
+                          (repeatable; heading text without the leading '#'s,
+                          matched at any heading level)
+      --no-template-check skip the repo issue/PR template comparison
   -h, --help              show this help and exit
 
 Download mode (gh-draft get): fetch an issue/PR from GitHub into a local
@@ -90,6 +92,13 @@ PR creation runs from the current checkout: it refuses main/master and a
 detached HEAD, pushes the current branch (setting upstream if needed), and
 uses the repo's default branch as base when 'base:' is absent. PR updates
 only edit title/body/labels/assignees; push new commits with plain git push.
+
+A body is published verbatim, so GitHub never applies the repository's
+issue/PR template to it. As a safety net, when the current checkout holds
+exactly one markdown template for the draft's type (.github/, docs/, or the
+root; ISSUE_TEMPLATE/ or PULL_REQUEST_TEMPLATE/ directories count), any of
+its headings missing from the body are listed and confirmation is asked.
+YAML issue forms and multi-template directories are not checked.
 EOF
 }
 
@@ -234,6 +243,90 @@ bb_add() {
 
 bb_remove() {
     gh api --method DELETE "repos/$REPO/issues/$1/dependencies/blocked_by/$2" >/dev/null
+}
+
+# --- repository template check ----------------------------------------------
+# gh publishes --body verbatim, so a repo's issue/PR template is silently
+# bypassed. Compare the body's headings against the template's and let the
+# user decide.
+
+# Heading text of a markdown document on stdin, one per line: HTML comments,
+# a leading YAML frontmatter block, and fenced code blocks are ignored.
+md_headings() {
+    awk '
+        NR == 1 && $0 == "---" { fm = 1; next }
+        fm { if ($0 == "---") fm = 0; next }
+        {
+            s = $0
+            while (1) {
+                if (incmt) {
+                    i = index(s, "-->")
+                    if (i == 0) { s = ""; break }
+                    s = substr(s, i + 3); incmt = 0
+                } else {
+                    i = index(s, "<!--")
+                    if (i == 0) break
+                    j = index(substr(s, i), "-->")
+                    if (j == 0) { s = substr(s, 1, i - 1); incmt = 1; break }
+                    s = substr(s, 1, i - 1) substr(s, i + j + 2)
+                }
+            }
+            if (s ~ /^[[:space:]]*```/) { fence = !fence; next }
+            if (fence) next
+            if (match(s, /^#+[[:space:]]/)) {
+                h = substr(s, RLENGTH + 1)
+                sub(/^[[:space:]]+/, "", h)
+                sub(/[[:space:]]*#*[[:space:]]*$/, "", h)
+                if (h != "") print h
+            }
+        }
+    '
+}
+
+# Repo-relative paths of the tracked markdown templates for TYPE, one per line.
+repo_template_paths() {
+    local pat
+    if [[ "$1" == "pr" ]]; then
+        pat='^(\.github/|docs/)?PULL_REQUEST_TEMPLATE(\.md|\.markdown)?$|^(\.github/|docs/)?PULL_REQUEST_TEMPLATE/[^/]+\.(md|markdown)$'
+    else
+        pat='^(\.github/|docs/)?ISSUE_TEMPLATE(\.md|\.markdown)?$|^(\.github/|docs/)?ISSUE_TEMPLATE/[^/]+\.(md|markdown)$'
+    fi
+    git -C "$2" ls-files 2>/dev/null | grep -iE "$pat" || true
+}
+
+template_check() {
+    [[ "$TEMPLATE_CHECK" == true ]] || return 0
+    local root
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    [[ -n "$root" ]] || return 0
+
+    local paths=()
+    mapfile -t paths < <(repo_template_paths "$TYPE" "$root")
+    if [[ ${#paths[@]} -gt 1 ]]; then
+        info "Note: this checkout has ${#paths[@]} $TYPE templates; skipping the template check."
+        return 0
+    fi
+    [[ ${#paths[@]} -eq 1 ]] || return 0
+
+    local want=() have=() missing=() w h found
+    mapfile -t want < <(md_headings < "$root/${paths[0]}")
+    [[ ${#want[@]} -gt 0 ]] || return 0
+    mapfile -t have < <(printf '%s\n' "$BODY" | md_headings)
+    for w in "${want[@]}"; do
+        found=false
+        for h in "${have[@]}"; do
+            [[ "${h,,}" == "${w,,}" ]] && { found=true; break; }
+        done
+        $found || missing+=("$w")
+    done
+    [[ ${#missing[@]} -gt 0 ]] || return 0
+
+    info "Warning: ${paths[0]} has sections this body does not:"
+    for w in "${missing[@]}"; do info "  - $w"; done
+    info "GitHub does not apply the template to a supplied body. Fill the missing"
+    info "sections in $DRAFT, or pass --no-template-check."
+    [[ "$DRY_RUN" == true ]] && return 0
+    confirm "Publish without them?" || { info "Aborted; nothing published."; exit 0; }
 }
 
 # --- download (gh-draft get) ------------------------------------------------
@@ -716,6 +809,7 @@ ASSUME_YES=false
 DRY_RUN=false
 PRUNE_DEPS=false
 ALLOW_DONE=false
+TEMPLATE_CHECK=true
 STRIP_SECTIONS=()
 POSITIONAL=()
 GET_MODE=false
@@ -743,6 +837,7 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run)    DRY_RUN=true; shift ;;
         --prune-deps)    PRUNE_DEPS=true; shift ;;
         --allow-done)    ALLOW_DONE=true; shift ;;
+        --no-template-check) TEMPLATE_CHECK=false; shift ;;
         --strip-section) [[ $# -ge 2 ]] || die "$1 requires an argument"; STRIP_SECTIONS+=("$2"); shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         --)              shift; POSITIONAL+=("$@"); break ;;
@@ -849,10 +944,25 @@ fi
 mapfile -t FM_STRIP < <(fm_list strip_sections)
 STRIP_SECTIONS+=("${FM_STRIP[@]}")
 for sec in "${STRIP_SECTIONS[@]}"; do
+    # A section runs from its heading to the next heading at the same or a
+    # shallower level, so nested subsections go with it.
     BODY=$(printf '%s\n' "$BODY" | awk -v name="$sec" '
-        { t = $0; sub(/[[:space:]]+$/, "", t) }
-        t == "## " name { skip = 1; next }
-        /^## / { skip = 0 }
+        {
+            t = $0
+            sub(/[[:space:]]+$/, "", t)
+            if (match(t, /^#+[[:space:]]/)) {
+                lvl = RLENGTH - 1
+                h = substr(t, RLENGTH + 1)
+                sub(/^[[:space:]]+/, "", h)
+                sub(/[[:space:]]*#*[[:space:]]*$/, "", h)
+                if (skip && lvl <= skiplvl) skip = 0
+                if (!skip && tolower(h) == tolower(name)) {
+                    skip = 1
+                    skiplvl = lvl
+                    next
+                }
+            }
+        }
         !skip { print }
     ')
 done
@@ -882,6 +992,8 @@ if [[ "$TYPE" == "issue" && ${#REVIEWERS[@]} -gt 0 ]]; then
 fi
 
 # --- go ---------------------------------------------------------------------
+
+template_check
 
 if [[ "$MODE" == "update" ]]; then
     run_update
