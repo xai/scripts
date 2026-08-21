@@ -57,5 +57,6 @@ docs/_build/
 target/
 
 # Personal/local tmux bootstrap; holds client and project names, kept out of
-# this (potentially public) repo. Remove this line if you sanitize and commit it.
+# this (potentially public) repo. Superseded by ./tmux-startup, which keeps all
+# of that in ~/.config/tmux-startup/; drop this line once startup.sh is gone.
 startup.sh

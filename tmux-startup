@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+"""Create tmux sessions, windows and panes from a JSON layout config.
+
+Everything machine-, client- or project-specific (session names, repo paths,
+commands to run) lives in the config file, so this script carries no private
+data and can be committed. Python 3 standard library only.
+
+Config: ${XDG_CONFIG_HOME:-~/.config}/tmux-startup/config.json
+        (override with $TMUX_STARTUP_CONFIG or --config)
+Hooks:  <config dir>/hooks/pre/*, <config dir>/hooks/post/*
+
+Get started with:
+    mkdir -p ~/.config/tmux-startup
+    tmux-startup --example > ~/.config/tmux-startup/config.json
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+
+PROG = "tmux-startup"
+
+# Shipped starter config: the host session with an admin window. Printed by
+# --example. Keys starting with '//' are ignored by the parser and used here
+# as comments, since JSON has none.
+EXAMPLE_CONFIG = r"""{
+  "// config": "tmux-startup layout config. Keys starting with '//' are ignored and serve as comments. Run 'tmux-startup --help' for the full schema.",
+
+  "// hooks": "Anything to do before the sessions exist — unlock ssh keys, fix the external keyboard, loginctl enable-linger — goes in an executable under hooks/pre/ next to this file, not in here. See 'tmux-startup --help'.",
+
+  "servers": {
+    "// default": "The plain tmux server. Add more entries for servers on their own socket, e.g. \"inner\": {\"args\": [\"-L\", \"inner\", \"-f\", \"~/.tmux.inner.conf\"]}, and point a session at one with \"server\": \"inner\".",
+    "default": {
+      "args": [],
+      "// launch": "Command prefix for starting the server, so it outlives this script's cgroup. Dropped automatically if the command is not installed.",
+      "launch": ["systemd-run", "--scope", "--user"]
+    }
+  },
+
+  "defaults": {
+    "server": "default",
+    "path": "~",
+    "layout": "tiled",
+    "// unknown_sessions": "What to do with an argument that names no configured session: \"error\", or \"create\" for a plain single-window session (what the old startup.sh did).",
+    "unknown_sessions": "error"
+  },
+
+  "sessions": [
+    {
+      "// name": "'{hostname}' expands to the short hostname, so this one entry is the host session — 'threefour' here, something else on the laptop.",
+      "name": "{hostname}",
+      "aliases": ["host"],
+      "autostart": true,
+      "path": "~",
+      "windows": [
+        {
+          "// admin": "A full-height shell on the left, htop over the kernel log on the right. Commands are typed into the pane's interactive shell, so your own aliases and functions work here too.",
+          "name": "admin",
+          "layout": "main-vertical",
+          "options": { "main-pane-width": "50%" },
+          "focus": 1,
+          "panes": [
+            {},
+            { "command": "htop" },
+            { "command": "journalctl -kf" }
+          ]
+        }
+      ]
+    }
+  ]
+}
+"""
+
+SCHEMA_HELP = """\
+config file
+-----------
+Looked up as --config, then $TMUX_STARTUP_CONFIG, then
+${XDG_CONFIG_HOME:-~/.config}/tmux-startup/config.json. Any object key
+starting with '//' is ignored, which is how the example config carries
+comments. 'tmux-startup --example' prints a starter config.
+
+  {
+    "servers":  { "<server>": { "args": [...], "launch": [...] } },
+    "defaults": { "server", "path", "layout", "unknown_sessions" },
+    "sessions": [ <session>, ... ]
+  }
+
+servers      tmux servers by name. "args" go before every tmux subcommand
+             (e.g. ["-L", "inner", "-f", "~/.tmux.inner.conf"] for a second
+             server on its own socket); "launch" is a command prefix used
+             only to start the server (e.g. ["systemd-run", "--scope",
+             "--user"]) and is dropped if that command is missing. Both get
+             ~ and $VAR expanded, since tmux is run without a shell.
+defaults     fallbacks for every session: server (default: "default"),
+             path (default: "~"), layout (default: "tiled") and
+             unknown_sessions, which decides what an argument naming no
+             configured session does — "error" (default) or "create",
+             which opens a plain single-window session.
+
+session
+    name        session name; required. Templates: {hostname} (short),
+                {fqdn}, {user}, {home}.
+    aliases     extra names accepted on the command line.
+    autostart   include this session in --all (default: false).
+    server      server to build it on (default: defaults.server).
+    path        working directory for windows that don't set one.
+    windows     list of windows; a session with none gets tmux's default
+                single window.
+    select      1-based window to leave active (default: 1).
+
+window
+    name        window name, templated like session names; renamed once the
+                panes are in place, so shell prompt hooks can't clobber it.
+    path        working directory for the window and its panes.
+    panes       list of panes, or an integer for that many empty panes
+                (default: 1).
+    layout      tmux layout applied after the panes exist: tiled (default),
+                even-horizontal, even-vertical, main-horizontal,
+                main-vertical, or a custom layout string as printed by
+                'tmux display-message -p "#{window_layout}"'.
+    options     window options set before the layout is applied — the main-*
+                layouts read main-pane-width / main-pane-height at apply
+                time, so {"main-pane-width": "50%"} splits down the middle.
+    focus       1-based pane to leave selected (default: 1).
+
+pane
+    path        working directory (default: the window's).
+    command     shell command sent to the pane, or a list of commands sent
+                in order. Typed into the pane's interactive shell, so your
+                own aliases and functions work; passed verbatim with no
+                templating, so $VARS and ${BRACES} survive intact.
+
+Paths get ~ and $VAR expanded. A window or pane path that does not exist is
+an error: that session is skipped and the exit status is non-zero, but the
+remaining sessions are still built.
+
+hooks
+-----
+Machine setup — unlocking ssh keys, taming an external keyboard, enabling
+linger — stays out of the config: it goes in executables next to it.
+
+  <config dir>/hooks/pre/*     run before any tmux server is touched
+  <config dir>/hooks/post/*    run once the sessions are built
+
+Every executable file in those directories runs in name order, so number
+them (10-keyboard, 20-ssh-agent). Files that aren't executable are skipped,
+which is how a hook is turned off; dotfiles are ignored. A hook that exits
+non-zero is reported and the run continues. Hooks inherit the environment
+plus $TMUX_STARTUP_CONFIG, $TMUX_STARTUP_HOOK ("pre" or "post") and
+$TMUX_STARTUP_SESSIONS (the session names, space separated).
+
+  $ cat ~/.config/tmux-startup/hooks/pre/20-ssh-agent
+  #!/bin/sh
+  for key in github work; do
+      ssh-add -l | grep -q "$(ssh-keygen -lf ~/.ssh/$key | awk '{print $2}')" ||
+          ssh-add ~/.ssh/$key
+  done
+  $ chmod +x ~/.config/tmux-startup/hooks/pre/20-ssh-agent
+"""
+
+EPILOG = SCHEMA_HELP + """
+examples
+--------
+  tmux-startup --example > ~/.config/tmux-startup/config.json
+  tmux-startup --list
+  tmux-startup threefour
+  tmux-startup --all --attach
+  tmux-startup -n threefour        # print the tmux commands, run nothing
+"""
+
+SESSION_KEYS = {"name", "aliases", "autostart", "server", "path", "windows", "select"}
+WINDOW_KEYS = {"name", "path", "panes", "layout", "options", "focus"}
+PANE_KEYS = {"path", "command"}
+SERVER_KEYS = {"args", "launch"}
+DEFAULTS_KEYS = {"server", "path", "layout", "unknown_sessions"}
+TOP_KEYS = {"servers", "defaults", "sessions"}
+
+
+class ConfigError(Exception):
+    """The config file is malformed or contradicts itself."""
+
+
+class TmuxError(Exception):
+    """A tmux command failed."""
+
+
+def warn(message):
+    print(f"{PROG}: warning: {message}", file=sys.stderr)
+
+
+def info(message):
+    print(message)
+
+
+# --------------------------------------------------------------------------
+# config loading
+# --------------------------------------------------------------------------
+
+def config_path(explicit=None):
+    if explicit:
+        return explicit
+    from_env = os.environ.get("TMUX_STARTUP_CONFIG")
+    if from_env:
+        return from_env
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "tmux-startup", "config.json")
+
+
+def strip_comments(value):
+    """Drop '//'-prefixed keys, which the config uses in place of comments."""
+    if isinstance(value, dict):
+        return {k: strip_comments(v) for k, v in value.items() if not k.startswith("//")}
+    if isinstance(value, list):
+        return [strip_comments(v) for v in value]
+    return value
+
+
+def load_config(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"No config at {path}\n"
+            f"       Create one with: mkdir -p {os.path.dirname(path)} && "
+            f"{PROG} --example > {path}"
+        )
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: line {exc.lineno}, column {exc.colno}: {exc.msg}")
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {path}: {exc}")
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: top level must be an object, found {type_name(raw)}")
+    return strip_comments(raw)
+
+
+def type_name(value):
+    return {
+        dict: "an object", list: "an array", str: "a string",
+        int: "a number", float: "a number", bool: "a boolean", type(None): "null",
+    }.get(type(value), type(value).__name__)
+
+
+def check_keys(obj, allowed, where):
+    for key in obj:
+        if key not in allowed:
+            warn(f"{where}: ignoring unknown key {key!r}")
+
+
+def want(obj, key, kinds, where, default=None):
+    """Fetch obj[key], checking its type. Missing keys yield the default."""
+    if key not in obj:
+        return default
+    value = obj[key]
+    # bool is a subclass of int, so a "true" where a number belongs must not
+    # slip through isinstance().
+    if not isinstance(value, kinds) or (isinstance(value, bool) and bool not in kinds):
+        expected = " or ".join(_kind_name(k) for k in kinds)
+        raise ConfigError(f"{where}.{key} must be {expected}, found {type_name(value)}")
+    return value
+
+
+def _kind_name(kind):
+    return {dict: "an object", list: "an array", str: "a string",
+            int: "a number", bool: "a boolean"}.get(kind, kind.__name__)
+
+
+def template_vars():
+    fqdn = socket.getfqdn()
+    return {
+        "hostname": socket.gethostname().split(".")[0],
+        "fqdn": fqdn,
+        "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "",
+        "home": os.path.expanduser("~"),
+    }
+
+
+def expand(value, variables, where):
+    """Expand {hostname}-style placeholders in a name."""
+    try:
+        return value.format(**variables)
+    except (KeyError, IndexError, ValueError) as exc:
+        known = ", ".join("{%s}" % k for k in sorted(variables))
+        raise ConfigError(f"{where}: cannot expand {value!r} ({exc}); known placeholders: {known}")
+
+
+def expand_path(value, variables, where):
+    return os.path.expanduser(os.path.expandvars(expand(value, variables, where)))
+
+
+def check_server_conf(spec, where):
+    """Warn about a "-f" that names no file, which tmux only reports on attach."""
+    args = spec.get("args", [])
+    for flag, value in zip(args, args[1:]):
+        if flag == "-f" and not os.path.isfile(value):
+            warn(f"{where}.args: no config file at {value}; "
+                 f"tmux will start without it and complain when a client attaches")
+
+
+def parse_config(raw, path):
+    """Validate the config and return (settings, sessions) with names expanded."""
+    check_keys(raw, TOP_KEYS, path)
+    variables = template_vars()
+
+    defaults = want(raw, "defaults", (dict,), path, {})
+    check_keys(defaults, DEFAULTS_KEYS, f"{path}.defaults")
+    default_server = want(defaults, "server", (str,), f"{path}.defaults", "default")
+    default_path = want(defaults, "path", (str,), f"{path}.defaults", "~")
+    default_layout = want(defaults, "layout", (str,), f"{path}.defaults", "tiled")
+    unknown = want(defaults, "unknown_sessions", (str,), f"{path}.defaults", "error")
+    if unknown not in ("error", "create"):
+        raise ConfigError(f"{path}.defaults.unknown_sessions must be \"error\" or \"create\", found {unknown!r}")
+
+    servers = want(raw, "servers", (dict,), path, {})
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            raise ConfigError(f"{path}.servers.{name} must be an object, found {type_name(spec)}")
+        check_keys(spec, SERVER_KEYS, f"{path}.servers.{name}")
+        for key in ("args", "launch"):
+            where = f"{path}.servers.{name}"
+            expanded = []
+            for i, item in enumerate(want(spec, key, (list,), where, [])):
+                if not isinstance(item, str):
+                    raise ConfigError(
+                        f"{where}.{key}[{i}] must be a string, found {type_name(item)}")
+                # tmux runs without a shell here, so a "-f ~/.tmux.foo.conf"
+                # would reach it with the tilde intact. tmux then defers the
+                # "No such file or directory" until the first client attaches,
+                # long after this script has exited, so expand it ourselves.
+                expanded.append(expand_path(item, variables, f"{where}.{key}[{i}]"))
+            if key in spec:
+                spec[key] = expanded
+        check_server_conf(spec, f"{path}.servers.{name}")
+    servers.setdefault("default", {})
+
+    settings = {
+        "path": path,
+        "hooks": os.path.join(os.path.dirname(os.path.abspath(path)), "hooks"),
+        "vars": variables,
+        "servers": servers,
+        "server": default_server,
+        "default_path": default_path,
+        "layout": default_layout,
+        "unknown_sessions": unknown,
+    }
+
+    sessions = []
+    for i, spec in enumerate(want(raw, "sessions", (list,), path, [])):
+        where = f"{path}.sessions[{i}]"
+        if not isinstance(spec, dict):
+            raise ConfigError(f"{where} must be an object, found {type_name(spec)}")
+        sessions.append(parse_session(spec, where, settings))
+
+    seen = {}
+    for session in sessions:
+        for name in [session["name"], *session["aliases"]]:
+            if name in seen:
+                raise ConfigError(f"{session['where']}: session name {name!r} is already used by {seen[name]}")
+            seen[name] = session["where"]
+
+    return settings, sessions
+
+
+def parse_session(spec, where, settings, variables=None):
+    variables = variables or settings["vars"]
+    check_keys(spec, SESSION_KEYS, where)
+
+    name = want(spec, "name", (str,), where)
+    if not name:
+        raise ConfigError(f"{where}.name is required")
+    name = expand(name, variables, f"{where}.name")
+
+    server = want(spec, "server", (str,), where, settings["server"])
+    if server not in settings["servers"]:
+        known = ", ".join(sorted(settings["servers"])) or "none"
+        raise ConfigError(f"{where}.server: no server named {server!r} is configured (have: {known})")
+
+    aliases = []
+    for i, alias in enumerate(want(spec, "aliases", (list,), where, [])):
+        if not isinstance(alias, str):
+            raise ConfigError(f"{where}.aliases[{i}] must be a string, found {type_name(alias)}")
+        aliases.append(expand(alias, variables, f"{where}.aliases[{i}]"))
+
+    session_path = expand_path(
+        want(spec, "path", (str,), where, settings["default_path"]), variables, f"{where}.path")
+
+    windows = []
+    for i, window in enumerate(want(spec, "windows", (list,), where, [])):
+        sub = f"{where}.windows[{i}]"
+        if not isinstance(window, dict):
+            raise ConfigError(f"{sub} must be an object, found {type_name(window)}")
+        windows.append(parse_window(window, sub, settings, session_path, variables))
+
+    select = want(spec, "select", (int,), where, 1)
+    if select < 1:
+        raise ConfigError(f"{where}.select must be 1 or greater, found {select}")
+
+    return {
+        "where": where,
+        "name": name,
+        "aliases": aliases,
+        "autostart": bool(want(spec, "autostart", (bool,), where, False)),
+        "server": server,
+        "path": session_path,
+        "windows": windows,
+        "select": select,
+    }
+
+
+def parse_window(spec, where, settings, session_path, variables):
+    check_keys(spec, WINDOW_KEYS, where)
+
+    name = want(spec, "name", (str,), where, "")
+    if name:
+        name = expand(name, variables, f"{where}.name")
+
+    window_path = spec.get("path")
+    window_path = (expand_path(want(spec, "path", (str,), where), variables, f"{where}.path")
+                   if window_path is not None else session_path)
+
+    raw_panes = spec.get("panes", 1)
+    panes = []
+    if isinstance(raw_panes, bool) or isinstance(raw_panes, float):
+        raise ConfigError(f"{where}.panes must be an array or a number, found {type_name(raw_panes)}")
+    if isinstance(raw_panes, int):
+        if raw_panes < 1:
+            raise ConfigError(f"{where}.panes must be 1 or greater, found {raw_panes}")
+        panes = [{"path": window_path, "commands": []} for _ in range(raw_panes)]
+    elif isinstance(raw_panes, list):
+        for i, pane in enumerate(raw_panes):
+            sub = f"{where}.panes[{i}]"
+            if not isinstance(pane, dict):
+                raise ConfigError(f"{sub} must be an object, found {type_name(pane)}")
+            check_keys(pane, PANE_KEYS, sub)
+            pane_path = pane.get("path")
+            pane_path = (expand_path(want(pane, "path", (str,), sub), variables, f"{sub}.path")
+                         if pane_path is not None else window_path)
+            command = pane.get("command", [])
+            if isinstance(command, str):
+                commands = [command]
+            elif isinstance(command, list):
+                commands = []
+                for j, item in enumerate(command):
+                    if not isinstance(item, str):
+                        raise ConfigError(f"{sub}.command[{j}] must be a string, found {type_name(item)}")
+                    commands.append(item)
+            else:
+                raise ConfigError(f"{sub}.command must be a string or an array, found {type_name(command)}")
+            panes.append({"path": pane_path, "commands": commands})
+        if not panes:
+            panes = [{"path": window_path, "commands": []}]
+    else:
+        raise ConfigError(f"{where}.panes must be an array or a number, found {type_name(raw_panes)}")
+
+    options = want(spec, "options", (dict,), where, {})
+    for key, value in options.items():
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ConfigError(f"{where}.options.{key} must be a string or a number, found {type_name(value)}")
+
+    focus = want(spec, "focus", (int,), where, 1)
+    if focus < 1:
+        raise ConfigError(f"{where}.focus must be 1 or greater, found {focus}")
+    if focus > len(panes):
+        warn(f"{where}.focus is {focus} but the window has {len(panes)} pane(s); focusing pane 1")
+        focus = 1
+
+    return {
+        "name": name,
+        "path": window_path,
+        "panes": panes,
+        "layout": want(spec, "layout", (str,), where, settings["layout"]),
+        "options": {k: str(v) for k, v in options.items()},
+        "focus": focus,
+    }
+
+
+# --------------------------------------------------------------------------
+# tmux
+# --------------------------------------------------------------------------
+
+class Tmux:
+    """One tmux server. Reads always run; writes only print on a dry run."""
+
+    def __init__(self, name, spec, dry_run):
+        self.name = name
+        self.args = list(spec.get("args", []))
+        self.launch = list(spec.get("launch", []))
+        self.dry_run = dry_run
+        self._fake = {}
+
+    def _argv(self, argv):
+        return ["tmux", *self.args, *argv]
+
+    def _fake_id(self, sigil):
+        """Stand-in for a tmux id, so dry-run output reads like a real run."""
+        self._fake[sigil] = self._fake.get(sigil, 0) + 1
+        return f"{sigil}{self._fake[sigil]}"
+
+    def capture(self, *argv):
+        """Query tmux. Returns None if the command fails (e.g. no server)."""
+        proc = subprocess.run(self._argv(argv), capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip()
+
+    def execute(self, *argv, fake=""):
+        """Run a state-changing tmux command; on a dry run just print it."""
+        if self.dry_run:
+            print("  " + shlex.join(self._argv(argv)))
+            return fake
+        proc = subprocess.run(self._argv(argv), capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or f"exit status {proc.returncode}"
+            raise TmuxError(f"{shlex.join(self._argv(argv))}: {detail}")
+        return proc.stdout.strip()
+
+    def is_running(self):
+        return subprocess.run(self._argv(["run-shell", "true"]),
+                              capture_output=True).returncode == 0
+
+    def ensure_running(self):
+        if self.is_running():
+            return
+        argv = self._argv(["start-server"])
+        launch = self.launch
+        if launch and shutil.which(launch[0]) is None:
+            warn(f"server {self.name!r}: {launch[0]} not found, starting tmux directly")
+            launch = []
+        info(f"Starting tmux server {self.name!r}")
+        if self.dry_run:
+            print("  " + shlex.join([*launch, *argv]))
+            return
+        proc = subprocess.run([*launch, *argv], capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or f"exit status {proc.returncode}"
+            raise TmuxError(f"Could not start tmux server {self.name!r}: {detail}")
+
+    def session_names(self):
+        out = self.capture("list-sessions", "-F", "#S")
+        return out.splitlines() if out else []
+
+    def has_session(self, name):
+        return name in self.session_names()
+
+    def new_window(self, session, window, first):
+        """Create the session's first window, or append one. Returns ids."""
+        argv = ["new-session", "-d", "-s", session] if first else ["new-window", "-t", session]
+        argv += ["-c", window["path"]]
+        if window["name"]:
+            argv += ["-n", window["name"]]
+        argv += ["-P", "-F", "#{window_id} #{pane_id}"]
+        out = self.execute(*argv, fake=f"{self._fake_id('@')} {self._fake_id('%')}")
+        window_id, _, pane_id = out.partition(" ")
+        return window_id, pane_id
+
+    def build_window(self, window_id, pane_id, window):
+        # Window options first: the main-* layouts read main-pane-width and
+        # main-pane-height when the layout is applied, not later.
+        for key, value in window["options"].items():
+            try:
+                self.execute("set-option", "-w", "-t", window_id, "--", key, value)
+            except TmuxError:
+                warn(f"tmux rejected window option {key} {value!r}")
+
+        pane_ids = [pane_id]
+        for pane in window["panes"][1:]:
+            try:
+                new_id = self.execute("split-window", "-t", pane_ids[-1], "-c", pane["path"],
+                                      "-P", "-F", "#{pane_id}", fake=self._fake_id("%"))
+            except TmuxError:
+                warn(f"created only {len(pane_ids)} of {len(window['panes'])} panes; window too small?")
+                break
+            pane_ids.append(new_id)
+            # Re-spread after each split so a small window doesn't run out of
+            # room before the final layout is applied.
+            self.execute("select-layout", "-t", window_id, "tiled")
+
+        try:
+            self.execute("select-layout", "-t", window_id, window["layout"])
+        except TmuxError:
+            warn(f"tmux rejected layout {window['layout']!r}; falling back to tiled")
+            self.execute("select-layout", "-t", window_id, "tiled")
+
+        for pane_id, pane in zip(pane_ids, window["panes"]):
+            for command in pane["commands"]:
+                self.execute("send-keys", "-t", pane_id, command, "Enter")
+
+        focus = min(window["focus"], len(pane_ids))
+        self.execute("select-pane", "-t", pane_ids[focus - 1])
+
+        # Shells may rename the window from a prompt hook while the panes come
+        # up, so set the name once everything is in place to make it stick.
+        if window["name"]:
+            self.execute("rename-window", "-t", window_id, window["name"])
+
+
+def run_hooks(hooks_dir, phase, sessions, config, dry_run):
+    """Run every executable in <hooks_dir>/<phase>, in name order."""
+    directory = os.path.join(hooks_dir, phase)
+    try:
+        entries = sorted(os.listdir(directory))
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError as exc:
+        warn(f"cannot read {directory}: {exc}")
+        return
+
+    hooks = [os.path.join(directory, e) for e in entries if not e.startswith(".")]
+    hooks = [h for h in hooks if os.path.isfile(h) and os.access(h, os.X_OK)]
+    if not hooks:
+        return
+
+    info(f"Running {phase} hooks")
+    env = dict(os.environ,
+               TMUX_STARTUP_CONFIG=config,
+               TMUX_STARTUP_HOOK=phase,
+               TMUX_STARTUP_SESSIONS=" ".join(sessions))
+    for hook in hooks:
+        if dry_run:
+            print(f"  {shlex.quote(hook)}")
+            continue
+        try:
+            proc = subprocess.run([hook], env=env)
+        except OSError as exc:
+            warn(f"cannot run {hook}: {exc}")
+            continue
+        if proc.returncode != 0:
+            warn(f"hook failed (exit {proc.returncode}): {hook}")
+
+
+def missing_paths(session):
+    """Directories the session needs that don't exist, in config order."""
+    missing = []
+    for window in session["windows"]:
+        for path in [window["path"], *(pane["path"] for pane in window["panes"])]:
+            if not os.path.isdir(path) and path not in missing:
+                missing.append(path)
+    return missing
+
+
+def start_session(session, servers, dry_run):
+    """Build one session. Returns True unless something went wrong."""
+    tmux = servers[session["server"]]
+    name = session["name"]
+
+    tmux.ensure_running()
+    if tmux.has_session(name):
+        info(f'Session "{name}" already exists')
+        return True
+
+    missing = missing_paths(session)
+    if missing:
+        warn(f'skipping session "{name}": directory does not exist: ' + ", ".join(missing))
+        return False
+
+    info(f'Setting up tmux session "{name}"')
+    windows = session["windows"] or [{"name": "", "path": session["path"], "panes":
+                                      [{"path": session["path"], "commands": []}],
+                                      "layout": "tiled", "options": {}, "focus": 1}]
+    window_ids = []
+    for i, window in enumerate(windows):
+        window_id, pane_id = tmux.new_window(name, window, first=(i == 0))
+        tmux.build_window(window_id, pane_id, window)
+        window_ids.append(window_id)
+
+    select = min(session["select"], len(window_ids))
+    tmux.execute("select-window", "-t", window_ids[select - 1])
+    return True
+
+
+
+def attach(tmux, name, dry_run):
+    if os.environ.get("TMUX"):
+        # Already inside tmux: switching the client is the only thing that
+        # works, and only on the same server.
+        if tmux.args:
+            warn(f'cannot attach to "{name}" from inside tmux: it lives on another server')
+            return
+        tmux.execute("switch-client", "-t", name)
+        return
+    argv = ["tmux", *tmux.args, "attach-session", "-t", name]
+    if dry_run:
+        print("  " + shlex.join(argv))
+        return
+    os.execvp("tmux", argv)
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+def resolve(requested, sessions, settings):
+    """Map command-line names onto configured sessions, in the given order."""
+    by_name = {}
+    for session in sessions:
+        for alias in [session["name"], *session["aliases"]]:
+            by_name[alias] = session
+    resolved, unknown = [], []
+    for name in requested:
+        session = by_name.get(name)
+        if session is not None:
+            if session not in resolved:
+                resolved.append(session)
+            continue
+        if settings["unknown_sessions"] == "create":
+            resolved.append({
+                "where": "<command line>", "name": name, "aliases": [], "autostart": False,
+                "server": settings["server"], "path": os.path.expanduser(settings["default_path"]),
+                "windows": [], "select": 1,
+            })
+        else:
+            unknown.append(name)
+    return resolved, unknown
+
+
+def list_sessions(sessions, servers):
+    if not sessions:
+        info("No sessions configured.")
+        return
+    running = {}
+    width = max(len(s["name"]) for s in sessions)
+    for session in sessions:
+        tmux = servers[session["server"]]
+        if tmux.name not in running:
+            running[tmux.name] = tmux.session_names() if tmux.is_running() else []
+        marks = []
+        if session["name"] in running[tmux.name]:
+            marks.append("running")
+        if session["autostart"]:
+            marks.append("autostart")
+        if session["aliases"]:
+            marks.append("aka " + ", ".join(session["aliases"]))
+        if session["server"] != "default":
+            marks.append(f"server {session['server']}")
+        windows = len(session["windows"])
+        detail = f"{windows} window{'s' if windows != 1 else ''}" if windows else "default window"
+        if marks:
+            detail += " [" + "; ".join(marks) + "]"
+        info(f"  {session['name']:<{width}}  {detail}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Create tmux sessions, windows and panes from a JSON layout config.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("sessions", nargs="*", metavar="SESSION",
+                        help="configured session names (or aliases) to start")
+    parser.add_argument("-c", "--config", metavar="PATH", help="config file to use")
+    parser.add_argument("-l", "--list", action="store_true", help="list configured sessions and exit")
+    parser.add_argument("--names", action="store_true",
+                        help="print session names and aliases, one per line (for shell completion)")
+    parser.add_argument("--all", action="store_true",
+                        help="start every session marked \"autostart\"")
+    parser.add_argument("-a", "--attach", action="store_true",
+                        help="attach to the first requested session when done")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="print the tmux commands instead of running them")
+    parser.add_argument("--example", action="store_true",
+                        help="print a starter config on stdout and exit")
+    args = parser.parse_args(argv)
+
+    if args.example:
+        sys.stdout.write(EXAMPLE_CONFIG)
+        return 0
+
+    if shutil.which("tmux") is None:
+        print(f"{PROG}: error: tmux is not installed", file=sys.stderr)
+        return 1
+
+    path = config_path(args.config)
+    try:
+        settings, sessions = parse_config(load_config(path), path)
+    except ConfigError as exc:
+        print(f"{PROG}: error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.names:
+        for session in sessions:
+            for name in [session["name"], *session["aliases"]]:
+                print(name)
+        return 0
+
+    servers = {name: Tmux(name, spec, args.dry_run)
+               for name, spec in settings["servers"].items()}
+
+    if args.list:
+        list_sessions(sessions, servers)
+        return 0
+
+    requested = list(args.sessions)
+    selected, unknown = resolve(requested, sessions, settings)
+    if args.all:
+        for session in sessions:
+            if session["autostart"] and session not in selected:
+                selected.append(session)
+
+    if unknown:
+        known = ", ".join(sorted(n for s in sessions for n in [s["name"], *s["aliases"]])) or "none"
+        for name in unknown:
+            print(f"{PROG}: error: no session named {name!r} in {path}", file=sys.stderr)
+        print(f"       configured: {known}", file=sys.stderr)
+        print(f'       set defaults.unknown_sessions to "create" to open plain sessions instead',
+              file=sys.stderr)
+        return 1
+
+    if not selected:
+        if not requested:
+            parser.print_usage(sys.stderr)
+            print(f"{PROG}: error: name a session, or use --all or --list", file=sys.stderr)
+            return 1
+        return 0
+
+    names = [session["name"] for session in selected]
+    run_hooks(settings["hooks"], "pre", names, path, args.dry_run)
+
+    failed = False
+    for session in selected:
+        try:
+            if not start_session(session, servers, args.dry_run):
+                failed = True
+        except TmuxError as exc:
+            warn(f'session "{session["name"]}": {exc}')
+            failed = True
+
+    run_hooks(settings["hooks"], "post", names, path, args.dry_run)
+
+    if args.attach:
+        first = selected[0]
+        attach(servers[first["server"]], first["name"], args.dry_run)
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
