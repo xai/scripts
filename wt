@@ -18,6 +18,8 @@ Commands:
     status    Show clean status overview of all worktrees
               -v, --verbose  Show detailed file lists and commits
     list      List all worktrees (with lock status)
+              --prs  Add a 'PR #<number>' column for branches with an open
+                     GitHub PR (needs gh, makes one API call)
     locked    List only locked worktrees
     add       Create a worktree for a branch (sibling of the current worktree):
               wt add <branch> [<start-point>]
@@ -55,6 +57,7 @@ Examples:
     wt status
     wt status -v
     wt list
+    wt list --prs
     wt locked
     wt checkout foobar ../
     wt add my-feature
@@ -171,10 +174,65 @@ get_worktree_branches() {
     }'
 }
 
+# Maps a worktree branch to the number of its open GitHub PR, one
+# "<branch>\t<number>" line each. Same-repo PRs are keyed by their head branch;
+# fork PRs by the pr-<number> branch 'wt open-pr' creates for them, since their
+# head name (e.g. 'main') can collide with unrelated local branches.
+# Silent no-op without gh or outside a GitHub repo.
+get_open_prs() {
+    command -v gh >/dev/null 2>&1 || return 0
+
+    gh pr list --state open --limit 200 \
+        --json number,headRefName,isCrossRepository \
+        -q '.[] | (if .isCrossRepository then "pr-\(.number)" else .headRefName end)
+                  + "\t" + (.number | tostring)' 2>/dev/null || true
+}
+
 list_worktrees() {
     require_repo
 
-    git worktree list
+    # The PR column costs a gh API call, so it is opt-in.
+    local with_prs=0
+    if [ "${1:-}" = "--prs" ]; then
+        with_prs=1
+        shift
+    fi
+    if [ $# -gt 0 ]; then
+        echo "Error: Unknown option for 'wt list': $1" >&2
+        echo "  Usage: wt list [--prs]" >&2
+        exit 1
+    fi
+
+    if [ "$with_prs" -eq 0 ]; then
+        git worktree list
+        return
+    fi
+
+    local -A pr_by_branch=()
+    local branch pr_num
+    while IFS=$'\t' read -r branch pr_num; do
+        [ -n "$branch" ] && pr_by_branch["$branch"]="$pr_num"
+    done < <(get_open_prs)
+
+    # Keep git's own formatting (it carries the lock/prunable flags) and append
+    # a PR column, padded to the width of the widest line.
+    local -a lines=() prs=()
+    local width=0 formatted path
+    while IFS=$'\t' read -r formatted path branch; do
+        lines+=("$formatted")
+        # Bare entries have no branch, so keep the subscript non-empty.
+        prs+=("${pr_by_branch[${branch:-(none)}]:-}")
+        [ "${#formatted}" -gt "$width" ] && width=${#formatted}
+    done < <(paste <(git worktree list) <(get_worktree_branches))
+
+    local i
+    for i in "${!lines[@]}"; do
+        if [ -n "${prs[$i]}" ]; then
+            printf '%-*s  PR #%s\n' "$width" "${lines[$i]}" "${prs[$i]}"
+        else
+            printf '%s\n' "${lines[$i]}"
+        fi
+    done
 }
 
 list_locked() {
@@ -1321,7 +1379,8 @@ case "${1:-help}" in
         status_worktrees "$@"
         ;;
     list|ls)
-        list_worktrees
+        shift
+        list_worktrees "$@"
         ;;
     locked)
         list_locked

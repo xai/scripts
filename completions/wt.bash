@@ -77,6 +77,9 @@ lock unlock run open open-pr close help"
         status|st)
             COMPREPLY=( $(compgen -W "-v --verbose" -- "$cur") )
             ;;
+        list|ls)
+            COMPREPLY=( $(compgen -W "--prs" -- "$cur") )
+            ;;
         run|exec)
             COMPREPLY=( $(compgen -W "--locked --all --" -- "$cur") )
             ;;
