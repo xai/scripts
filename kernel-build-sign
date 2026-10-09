@@ -128,7 +128,7 @@ cmd_sign() {
 
 cmd_build() {
   local arg="${1:?usage: $0 build <version|tarball>   (e.g. 7.1.0, or ./linux-7.1-rc1.tar.gz)}"
-  need make; need gcc; need tar; need dracut; need openssl
+  need make; need gcc; need tar; need dracut; need openssl; need pahole dwarves
   require_mok
   sudo_keepalive
 
@@ -175,12 +175,17 @@ cmd_build() {
   # Build-with-Ubuntu-config gotchas + keep module signing (so modules load under lockdown):
   ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""      # don't require Canonical's cert
   ./scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
-  ./scripts/config --disable DEBUG_INFO_BTF              # avoids pahole-version build breakage
+  # BTF lets prebuilt (CO-RE) eBPF tools load, e.g. rustnet's process attribution. Enabled
+  # explicitly: a config seeded from a kernel built without it has no line to inherit, and
+  # olddefconfig silently drops it again if pahole is missing or older than 1.22.
+  ./scripts/config --enable  DEBUG_INFO_BTF
   ./scripts/config --enable  MODULE_SIG --enable MODULE_SIG_ALL
   ./scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"  # default path → kbuild auto-generates + embeds the key; the kernel then trusts its own modules
   ./scripts/config --set-str MODULE_SIG_HASH "sha256"
   [[ -n "$LOCALVERSION" ]] && ./scripts/config --set-str LOCALVERSION "$LOCALVERSION"
   make olddefconfig
+  grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config \
+    || warn "BTF dropped by olddefconfig (pahole $(pahole --version) too old? needs >= v1.22) — eBPF CO-RE tools won't load on this kernel"
   local krel; krel="$(make -s kernelrelease)"
   info "Will build + install kernel release: $krel  (jobs=$JOBS)"
   read -rp "Proceed with the full build? [y/N] " ans; [[ "$ans" == [yY]* ]] || die "aborted."
